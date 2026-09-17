@@ -1,0 +1,20 @@
+﻿{
+  "name": "obsidian-gcal-reminder-sync",
+  "version": "1.0.0",
+  "description": "Bidirectional reminder synchronization between Obsidian tasks and Google Calendar",
+  "main": "main.js",
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "google-calendar",
+    "reminder",
+    "tasks",
+    "sync"
+  ],
+  "author": "yuangr",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yuangr/obsidian-gcal-reminder-sync.git"
+  }
+}

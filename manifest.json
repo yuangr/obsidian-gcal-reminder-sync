@@ -1,0 +1,10 @@
+﻿{
+  "id": "gcal-reminder-sync",
+  "name": "GCal Reminder Sync",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "轻量级、高可用的 Obsidian 待办任务与 Google 日历双向强提醒闭环同步插件",
+  "author": "yuangr",
+  "authorUrl": "https://github.com/yuangr",
+  "isDesktopOnly": false
+}
