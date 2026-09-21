@@ -1,1161 +1,596 @@
-﻿const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, MarkdownView } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, MarkdownView, Modal } = require('obsidian');
 
 const DEFAULT_SETTINGS = {
-    webhookUrl: '',
-    triggerKeyword: '!gcal',
-    reminderMinutes: 15,
-    calendarName: 'Obsidian提醒',
-    defaultDuration: 30,
-    defaultTime: '09:00',       // 仅写日期时的默认提醒时间
-    treatAllDayAsTimed: true,   // 仅写日期时自动转为默认时间提醒（彻底解决全天日程在“前一天 23:45”误响问题）
-    autoTriggerOnType: true,
-    completeAction: 'delete',   // 'delete' (从日历彻底删除) 或 'markDone' (置灰标记完成)
-    autoUpdateOnEdit: true,     // 修改内容或日期时间自动原地更新日历
-    editDebounceSeconds: 2.0,   // 编辑停顿防抖秒数
-    syncOnLineLeave: true,      // 光标离开行时立即同步
-    syncedSignatures: {}        // 持久化存储 eventId -> lineSignature
+    webhookUrl: '', sharedSecret: '', triggerKeyword: '!gcal',
+    reminderMinutes: 15, defaultDuration: 30, defaultTime: '09:00',
+    timeZone: '', treatAllDayAsTimed: true, autoTriggerOnType: true,
+    autoUpdateOnEdit: true, completeAction: 'delete', editDebounceSeconds: 2, syncOnLineLeave: true,
+    syncFolder: '', syncState: {}, failures: {}
 };
+const MARKERS = /<!--\s*gcal(?:-task|-cycle|-syncing|-deleting|-done|-deleted|-all-day)?(?:\s*:[^>]*?)?\s*-->/g;
+const RETRY_DELAYS = [2000, 10000, 30000];
 
-function safeParseJson(response) {
-    if (!response) return null;
-    if (response.json && typeof response.json === 'object') {
-        return response.json;
+function newTaskId() {
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+function metadata(line) {
+    const id = line.match(/<!--\s*gcal-task:\s*([a-f0-9]{32})\s*-->/);
+    const binding = line.match(/<!--\s*gcal(-deleting|-done|-deleted)?:\s*([^>\s]+)\s*-->/);
+    const cycle = line.match(/<!--\s*gcal-cycle:\s*(\d+)\s*-->/);
+    return { id: id && id[1], eventId: binding && binding[2],
+        state: binding ? (binding[1] || '').replace('-', '') : '',
+        cycle: cycle ? Number(cycle[1]) : 0,
+        pending: /<!--\s*gcal-syncing\s*-->/.test(line),
+        allDay: /<!--\s*gcal-all-day\s*-->/.test(line) };
+}
+function visible(line) { return line.replace(MARKERS, '').trim(); }
+function taskRows(text) {
+    const rows = [], lines = text.split('\n');
+    let fence = null;
+    for (let i = 0; i < lines.length; i++) {
+        const match = lines[i].match(/^\s*([~]{3,}|[\x60]{3,})/);
+        if (match) {
+            if (!fence) fence = match[1];
+            else if (match[1][0] === fence[0] && match[1].length >= fence.length) fence = null;
+            continue;
+        }
+        if (!fence && /^\s*[-*+]\s+\[[ xX]\]\s*/.test(lines[i])) rows.push({ index: i, line: lines[i] });
     }
-    if (response.text) {
+    return rows;
+}
+function validDate(date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return false;
+    const value = new Date(date + 'T00:00:00Z');
+    return !isNaN(value) && value.toISOString().slice(0, 10) === date;
+}
+function validTime(time) { return /^([01]\d|2[0-3]):[0-5]\d$/.test(time || ''); }
+function config(settings) {
+    const minutes = Number(settings.reminderMinutes), duration = Number(settings.defaultDuration);
+    if (!Number.isInteger(minutes) || minutes < -1 || minutes > 40320) throw new Error('提醒分钟数应为 0–40320，或 -1（关闭提醒）');
+    if (!Number.isInteger(duration) || duration < 1 || duration > 1440) throw new Error('时长应为 1–1440 分钟');
+    if (!validTime(settings.defaultTime)) throw new Error('默认时间必须为有效的 HH:mm');
+    const timeZone = settings.timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try { new Intl.DateTimeFormat('en', { timeZone }).format(); }
+    catch (_) { throw new Error('无效的 IANA 时区，例如 Asia/Shanghai'); }
+    return { reminderMinutes: minutes, durationMinutes: duration, timeZone };
+}
+// A single parser is used by both push and pull. Explicit reminders take priority.
+function parseTask(line, settings) {
+    const prefix = line.match(/^(\s*[-*+]\s+\[([ xX])\]\s*)/);
+    if (!prefix) return null;
+    const m = metadata(line), tokens = [];
+    const body = line.slice(prefix[0].length).replace(MARKERS, '');
+    const pattern = /\(@(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?\)|([📅⏰⏳🛫])\s*(?:(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?|(\d{2}:\d{2}))|(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?/gu;
+    for (const match of body.matchAll(pattern)) {
+        const kind = match[1] ? 'reminder' : (match[3] || 'plain');
+        tokens.push({ start: match.index, end: match.index + match[0].length, raw: match[0], kind,
+            date: match[1] || match[4] || match[7] || null,
+            time: match[2] || match[5] || match[6] || match[8] || null });
+    }
+    const rank = { reminder: 0, '⏰': 1, '📅': 2, '⏳': 3, '🛫': 4, plain: 5 };
+    const sorted = tokens.slice().sort((a, b) => rank[a.kind] - rank[b.kind]);
+    const selectedDate = sorted.find(t => t.date);
+    const selectedTime = sorted.find(t => t.time);
+    let title = body;
+    for (const t of tokens.slice().reverse()) title = title.slice(0, t.start) + title.slice(t.end);
+    if (settings.triggerKeyword) title = title.split(settings.triggerKeyword).join('');
+    title = title.replace(/\s+/g, ' ').trim() || 'Obsidian 提醒任务';
+    const date = selectedDate ? selectedDate.date : null;
+    let time = selectedTime ? selectedTime.time : null;
+    if (date && !validDate(date)) throw new Error('任务日期无效：' + date);
+    if (time && !validTime(time)) throw new Error('任务时间无效：' + time);
+    if (!time && !m.allDay && settings.treatAllDayAsTimed) time = settings.defaultTime;
+    return { title, date, time, done: prefix[2].toLowerCase() === 'x', prefix: prefix[0],
+        tokens, selectedDate, selectedTime, meta: m };
+}
+function withBinding(line, state, eventId, id, cycle) {
+    const allDay = metadata(line).allDay;
+    const clean = line.replace(MARKERS, '').trimEnd();
+    return clean + ' <!-- gcal-task: ' + id + ' -->' +
+        (cycle ? ' <!-- gcal-cycle: ' + cycle + ' -->' : '') +
+        (allDay ? ' <!-- gcal-all-day -->' : '') +
+        (eventId ? ' <!-- gcal' + (state ? '-' + state : '') + ': ' + eventId + ' -->' : ' <!-- gcal-syncing -->');
+}
+function renderRemote(line, event, settings) {
+    const task = parseTask(line, settings);
+    if (!task || !validDate(event.date) || (event.time !== null && !validTime(event.time))) throw new Error('日历返回了无效日期或时间');
+    const chosen = task.selectedDate || task.selectedTime;
+    let tokens = task.tokens.map(t => {
+        if (t !== chosen && t !== task.selectedTime) return t.raw;
+        if (t === task.selectedTime && t !== chosen) return event.time ? '⏰ ' + event.time : '';
+        const suffix = event.time ? ' ' + event.time : '';
+        if (t.kind === 'reminder') return '(@' + event.date + suffix + ')';
+        if (t.kind === 'plain') return event.date + suffix;
+        return t.kind + ' ' + event.date + suffix;
+    }).filter(Boolean);
+    if (!chosen) tokens = ['(@' + event.date + (event.time ? ' ' + event.time : '') + ')'];
+    const prefix = event.completed ? task.prefix.replace('[ ]', '[x]') : task.prefix;
+    let next = prefix + String(event.title).replace(/[\r\n]/g, ' ') + ' ' + tokens.join(' ');
+    next = withBinding(next, event.completed ? 'done' : '', event.eventId || task.meta.eventId, task.meta.id, task.meta.cycle);
+    if (event.time === null) next += ' <!-- gcal-all-day -->';
+    return next;
+}
+function fingerprint(task, settings) {
+    return JSON.stringify([task.title, task.date, task.time, task.done, task.meta.cycle,
+        config(settings), settings.completeAction]);
+}
+function replaceTask(text, id, transform) {
+    const rows = taskRows(text).filter(r => metadata(r.line).id === id);
+    if (rows.length > 1) throw new Error('检测到重复任务标识，请移除复制任务的 gcal 注释后重新同步');
+    if (!rows.length) return text;
+    const lines = text.split('\n'), next = transform(rows[0].line);
+    if (typeof next === 'string') lines[rows[0].index] = next;
+    return lines.join('\n');
+}
+function readJson(response) {
+    try {
+        const parsed = response.text ? JSON.parse(response.text) : response.json;
+        if (parsed && typeof parsed === 'object') return parsed;
+    } catch (_) { /* Avoid logging payloads or shared secrets. */ }
+    throw Object.assign(new Error('Webhook 返回非 JSON；请检查部署地址和访问权限'), { retryable: false });
+}
+
+class SyncEngine {
+    constructor(options) {
+        Object.assign(this, options);
+        this.queue = new Map(); this.retryTimers = new Map(); this.locations = new Map();
+        this.running = false; this.stopped = false; this.idleWaiters = [];
+    }
+    async prepare(source) {
+        await source.transform(text => {
+            const lines = text.split('\n');
+            for (const row of taskRows(text)) {
+                const m = metadata(row.line);
+                const eligible = m.eventId || (this.settings.autoTriggerOnType && this.settings.triggerKeyword && row.line.includes(this.settings.triggerKeyword));
+                if (!eligible || m.id || m.pending) continue;
+                const task = parseTask(row.line, this.settings);
+                if (!m.eventId && (task.done || !task.date)) continue;
+                lines[row.index] = row.line + ' <!-- gcal-task: ' + this.newId() + ' -->';
+            }
+            return lines.join('\n');
+        });
+    }
+    async scan(source, force = false) {
+        if (this.stopped) return;
         try {
-            return JSON.parse(response.text);
-        } catch (e) {
-            console.error('[GCal JSON Parse Error]', e, response.text);
+            config(this.settings);
+            await this.prepare(source);
+            const seen = new Set();
+            for (const row of taskRows(await source.read())) {
+                const m = metadata(row.line);
+                if (!m.id) continue;
+                if (seen.has(m.id)) throw new Error('同一笔记内存在重复任务标识');
+                seen.add(m.id);
+                const previous = this.locations.get(m.id);
+                if (previous && previous !== source && await this.find(previous, m.id)) throw new Error('两篇笔记包含相同任务标识，请清理复制任务的关联注释');
+                this.locations.set(m.id, source);
+            }
+            for (const id of seen) this.enqueue(id, source, force);
+        } catch (error) { this.notify(error.message, true); }
+    }
+    enqueue(id, source, force = false) {
+        if (this.stopped) return;
+        const old = this.queue.get(id);
+        this.queue.set(id, { id, source, force: force || !!old?.force });
+        void this.pump();
+    }
+    async find(source, id) {
+        const rows = taskRows(await source.read()).filter(r => metadata(r.line).id === id);
+        if (rows.length > 1) throw new Error('重复任务标识，已暂停同步');
+        return rows.length ? rows[0].line : null;
+    }
+    async change(source, id, transform) {
+        if (!this.stopped) await source.transform(text => replaceTask(text, id, transform));
+    }
+    async pump() {
+        if (this.running || this.stopped) return;
+        this.running = true;
+        try {
+            while (this.queue.size && !this.stopped) {
+                const [key, job] = this.queue.entries().next().value;
+                this.queue.delete(key);
+                try {
+                    if (job.pull) await this.pullNow(job.source);
+                    else if (job.adopt) await this.adoptNow(job.source);
+                    else await this.run(job);
+                } catch (error) { this.notify(error.message, true); }
+            }
+        } finally {
+            this.running = false;
+            this.idleWaiters.splice(0).forEach(resolve => resolve());
         }
     }
-    return null;
+    idle() { return !this.running ? Promise.resolve() : new Promise(resolve => this.idleWaiters.push(resolve)); }
+    async run({ id, source, force }) {
+        const line = await this.find(source, id);
+        if (!line || this.stopped) return;
+        const task = parseTask(line, this.settings), m = task.meta;
+        const operationSettings = { ...this.settings };
+        const signature = fingerprint(task, operationSettings);
+        const failed = this.settings.failures[id];
+        if (failed && failed.signature === signature && !force) {
+            if (failed.terminal) return;
+            if (failed.nextAt > Date.now()) { this.armRetry(id, source, failed.nextAt); return; }
+        } else if (failed) {
+            delete this.settings.failures[id];
+            this.cancelRetry(id);
+        }
+        const prior = this.settings.syncState[id];
+        if (m.state === 'deleted' && !force) return; // An explicit remote deletion is never silently resurrected.
+        if (task.done && ((!m.eventId && !m.pending) || m.state === 'done' || m.state === 'deleted')) return;
+        if (!task.done && !task.date) return;
+        if (!force && !task.done && m.eventId && !m.state &&
+            (!this.settings.autoUpdateOnEdit || (prior && prior.signature === signature))) return;
+        // Unknown old links must first be pulled/migrated, rather than assuming local text was synced.
+        if (!force && m.eventId && !prior && !m.state && !task.done) return;
+        // A pending create may already exist remotely even if its response was lost.
+        // Resolve its deterministic ID first, then apply a newly checked completion.
+        let action = m.eventId ? (task.done ? 'complete' : 'update') : 'create';
+        let cycle = m.cycle;
+        if (m.state === 'deleted' || (force && failed?.code === 'DELETED_GENERATION') || (m.state === 'done' && prior?.completionMode === 'delete')) {
+            cycle++;
+            await this.change(source, id, l => withBinding(l, '', null, id, cycle));
+            action = 'create';
+        }
+        const payload = { action, taskId: id, cycle, eventId: m.eventId,
+            title: task.title, date: task.date, time: task.time, ...config(operationSettings),
+            completeMode: operationSettings.completeAction, expectedEtag: force ? null : prior?.etag };
+        if (action === 'create') {
+            payload.eventId = null;
+            await this.change(source, id, l => withBinding(
+                this.settings.triggerKeyword ? l.split(this.settings.triggerKeyword).join('') : l, '', null, id, cycle));
+        }
+        try {
+            let result;
+            try { result = await this.send(payload); }
+            catch (error) {
+                // Reopening a task completed on another device: absence was explicitly confirmed.
+                if (error.code === 'NOT_FOUND' && m.state === 'done' && !task.done) {
+                    await this.change(source, id, l => withBinding(l, '', null, id, cycle + 1));
+                    this.enqueue(id, source);
+                    return;
+                }
+                if (error.code === 'NOT_FOUND' && m.eventId && !task.done) {
+                    await this.change(source, id, l => withBinding(l, 'deleted', m.eventId, id, cycle));
+                }
+                throw error;
+            }
+            if (this.stopped) return;
+            if (!result.eventId) throw Object.assign(new Error('响应缺少事件 ID'), { retryable: false });
+            const found = await this.find(source, id);
+            if (!found) {
+                if (action === 'create') await this.send({ action: 'complete', taskId: id, eventId: result.eventId, completeMode: 'delete' });
+                return;
+            }
+            await this.change(source, id, l => withBinding(l, action === 'complete' ? 'done' : '', result.eventId, id, cycle));
+            const sentTask = { ...task,
+                done: action === 'complete',
+                title: result.event ? result.event.title : task.title,
+                date: result.event ? result.event.date : task.date,
+                time: result.event ? result.event.time : task.time,
+                meta: { ...m, cycle } };
+            this.settings.syncState[id] = { signature: fingerprint(sentTask, operationSettings), line: visible(line),
+                eventId: result.eventId, etag: result.etag || null,
+                completionMode: action === 'complete' ? operationSettings.completeAction : null };
+            delete this.settings.failures[id]; this.cancelRetry(id);
+            await this.save();
+            this.notify(action === 'complete' ? '完成状态已同步' : '任务已同步');
+            const current = await this.find(source, id);
+            if (current && fingerprint(parseTask(current, this.settings), this.settings) !== fingerprint(sentTask, operationSettings)) {
+                this.enqueue(id, source);
+            }
+        } catch (error) {
+            if (this.stopped) return;
+            const previous = this.settings.failures[id];
+            const attempts = previous?.signature === signature ? previous.attempts + 1 : 1;
+            const terminal = !error.retryable || attempts > RETRY_DELAYS.length;
+            const nextAt = terminal ? 0 : Date.now() + RETRY_DELAYS[attempts - 1];
+            this.settings.failures[id] = { signature, attempts, terminal, nextAt, message: error.message, code: error.code };
+            await this.save();
+            if (!terminal) this.armRetry(id, source, nextAt);
+            this.notify(error.message + (terminal ? '；修正后手动重试' : '；稍后重试'), true);
+        }
+    }
+    armRetry(id, source, at) {
+        if (this.stopped || this.retryTimers.has(id)) return;
+        this.retryTimers.set(id, setTimeout(() => {
+            this.retryTimers.delete(id); this.enqueue(id, source);
+        }, Math.max(0, at - Date.now())));
+    }
+    cancelRetry(id) {
+        if (this.retryTimers.has(id)) clearTimeout(this.retryTimers.get(id));
+        this.retryTimers.delete(id);
+    }
+    pull(source) { this.queue.set('pull:' + source.key, { source, pull: true }); void this.pump(); return this.idle(); }
+    adopt(source) { this.queue.set('adopt:' + source.key, { source, adopt: true }); void this.pump(); return this.idle(); }
+    async adoptNow(source) {
+        await this.prepare(source);
+        for (const row of taskRows(await source.read())) {
+            const m = metadata(row.line);
+            if (!m.id || !m.eventId) continue;
+            await this.send({ action: 'adopt', taskId: m.id, eventId: m.eventId });
+        }
+        await this.pullNow(source);
+    }
+    async pullNow(source) {
+        await this.prepare(source);
+        const snapshots = new Map();
+        for (const row of taskRows(await source.read())) {
+            const m = metadata(row.line);
+            if (!m.id || !m.eventId || m.state === 'done' || m.state === 'deleted') continue;
+            if (snapshots.has(m.id)) throw new Error('重复任务标识，无法安全拉取');
+            const task = parseTask(row.line, this.settings), prior = this.settings.syncState[m.id];
+            if (prior && prior.signature !== fingerprint(task, this.settings)) {
+                this.notify('任务有未同步本地修改，已跳过拉取：' + task.title, true); continue;
+            }
+            snapshots.set(m.id, { line: row.line, task });
+        }
+        // Bounded batches keep Apps Script executions below service/runtime limits.
+        const entries = Array.from(snapshots.entries());
+        for (let offset = 0; offset < entries.length; offset += 50) {
+            const batch = entries.slice(offset, offset + 50);
+            const result = await this.send({ action: 'pull', timeZone: config(this.settings).timeZone,
+                tasks: batch.map(([id, s]) => ({ taskId: id, eventId: s.task.meta.eventId })) });
+            if (this.stopped) return;
+            for (const [id, snapshot] of batch) {
+                const event = result.events && result.events[id];
+                if (!event || event.error) { this.notify(event?.error || '缺少日历查询结果', true); continue; }
+                let applied = null;
+                await this.change(source, id, current => {
+                    if (current !== snapshot.line) { this.notify('拉取期间任务已修改，已保留本地内容', true); return current; }
+                    applied = event.exists === false ?
+                        withBinding(current, 'deleted', snapshot.task.meta.eventId, id, snapshot.task.meta.cycle) :
+                        renderRemote(current, event, this.settings);
+                    return applied;
+                });
+                if (applied) {
+                    delete this.settings.failures[id]; this.cancelRetry(id);
+                    if (event.exists === false) delete this.settings.syncState[id];
+                    else this.settings.syncState[id] = { signature: fingerprint(parseTask(applied, this.settings), this.settings),
+                        line: visible(applied), eventId: event.eventId, etag: event.etag, completionMode: event.completed ? 'markDone' : null };
+                }
+            }
+            await this.save();
+        }
+        this.notify('拉取完成；冲突或失败的任务保留本地内容');
+    }
+    stop() {
+        this.stopped = true; this.queue.clear();
+        for (const id of this.retryTimers.keys()) this.cancelRetry(id);
+    }
+}
+
+class ConfirmModal extends Modal {
+    constructor(app, message, resolve) { super(app); this.message = message; this.resolve = resolve; this.accepted = false; }
+    onOpen() {
+        this.contentEl.createEl('p', { text: this.message });
+        new Setting(this.contentEl).addButton(b => b.setButtonText('取消').onClick(() => this.close()))
+            .addButton(b => b.setButtonText('确认继续').setCta().onClick(() => { this.accepted = true; this.close(); }));
+    }
+    onClose() { this.resolve(this.accepted); }
 }
 
 class GCalReminderSyncPlugin extends Plugin {
     async onload() {
-        await this.loadSettings();
-
-        this.debounceTimer = null;
-        this.activeEditingLine = -1;
-        this.inFlightUpdates = new Set();
-        this.inFlightCreations = new Set();
-        this.pendingUpdates = new Map(); // eventId -> { task, signature }
-        this.failedEvents = new Set();
-        this.isProcessingQueue = false;
-
-        // 1. 状态栏状态指示器 (Status Bar)
-        this.statusBarItem = this.addStatusBarItem();
-        this.updateStatusBar('ready');
-
-        // 2. 左侧边栏快捷功能按钮 (Ribbon Icon)
-        this.addRibbonIcon('calendar-sync', '从 Google 日历双向同步拉取 (Pull)', () => {
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (!view || !view.editor) {
-                new Notice('⚠️ 请先打开或聚焦一个待办笔记！');
-                return;
-            }
-            this.pullTasksFromGCal(view.editor);
-        });
-
-        // 3. 打开笔记或切换标签页时：建立签名索引，并自动补偿扫描遗留草稿
-        this.registerEvent(
-            this.app.workspace.on('file-open', () => {
-                this.indexActiveEditorSignatures();
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (view && view.editor && this.settings.autoTriggerOnType) {
-                    setTimeout(() => {
-                        this.checkNewDraftTasks(view.editor);
-                    }, 500);
-                }
-            })
-        );
-
-        // 4. 编辑器内容变化监听
-        this.registerEvent(
-            this.app.workspace.on('editor-change', (editor) => {
-                this.handleEditorChange(editor);
-            })
-        );
-
-        // 5. 命令：同步当前光标所在行（新建或强制修改）
-        this.addCommand({
-            id: 'sync-current-line-to-gcal',
-            name: '同步当前行待办到 Google 日历 (新建/更新)',
-            callback: () => {
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (!view || !view.editor) {
-                    new Notice('⚠️ 请先打开或聚焦一个 Markdown 笔记！');
-                    return;
-                }
-                this.syncCurrentLine(view.editor, true);
-            }
-        });
-
-        // 6. 命令：从 Google 日历双向回传拉取 (Pull)
-        this.addCommand({
-            id: 'pull-tasks-from-gcal',
-            name: '从 Google 日历拉取并更新当前笔记待办 (双向回传)',
-            callback: () => {
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (!view || !view.editor) {
-                    new Notice('⚠️ 请先打开或聚焦一个 Markdown 笔记！');
-                    return;
-                }
-                this.pullTasksFromGCal(view.editor);
-            }
-        });
-
-        // 7. 命令：全量强制检查并同步当前笔记所有活动待办
-        this.addCommand({
-            id: 'force-sync-all-tasks',
-            name: '全量检查并同步当前笔记所有已关联待办到 Google 日历',
-            callback: () => {
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (!view || !view.editor) {
-                    new Notice('⚠️ 请先打开或聚焦一个 Markdown 笔记！');
-                    return;
-                }
-                this.forceSyncAllActiveTasks(view.editor);
-            }
-        });
-
-        // 8. 命令：测试 Google Webhook 连接
-        this.addCommand({
-            id: 'test-gcal-webhook',
-            name: '测试 Google Webhook 连接状态',
-            callback: () => {
-                this.testConnection();
-            }
-        });
-
-        // 9. 注册配置面板
+        const data = await this.loadData();
+        this.settings = { ...DEFAULT_SETTINGS, ...data,
+            syncState: { ...data?.syncState }, failures: { ...data?.failures } };
+        this.sources = new WeakMap(); this.debounces = new Map(); this.lastLines = new WeakMap(); this.saveChain = Promise.resolve();
+        this.stopped = false; this.session = null; this.status = this.addStatusBarItem();
+        this.engine = new SyncEngine({ settings: this.settings, newId: newTaskId,
+            send: data => this.send(data), save: () => this.saveSettings(),
+            notify: (text, error) => this.notify(text, error) });
         this.addSettingTab(new GCalSettingTab(this.app, this));
-
-        // 10. 界面布局就绪时首次初始化
+        this.addRibbonIcon('calendar-check', '拉取当前笔记的 Google 日历变更', () => this.current(source => this.engine.pull(source)));
+        this.addCommand({ id: 'sync-current-line-to-gcal', name: '同步当前行（重试／恢复）', callback: () => void this.syncCurrentLine() });
+        this.addCommand({ id: 'pull-tasks-from-gcal', name: '从 Google 日历拉取当前笔记', callback: () => this.current(s => this.engine.pull(s)) });
+        this.addCommand({ id: 'force-sync-all-tasks', name: '重试当前笔记全部已关联任务', callback: () => this.current(s => this.engine.scan(s, true)) });
+        this.addCommand({ id: 'test-gcal-webhook', name: '测试 Webhook 连接（不创建事件）', callback: () => void this.testConnection() });
+        this.addCommand({ id: 'adopt-legacy-tasks', name: '迁移当前笔记的旧版事件关联', callback: () => void this.adoptLegacy() });
+        this.registerEvent(this.app.workspace.on('editor-change', (editor, info) => {
+            if (!info?.file) return;
+            const previous = this.lastLines.get(editor), current = editor.getCursor().line;
+            this.lastLines.set(editor, current);
+            this.schedule(info.file, this.settings.syncOnLineLeave && previous !== undefined && previous !== current ? 0 : null);
+        }));
+        if (typeof document !== 'undefined') {
+            const cursorMoved = () => {
+                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                if (!view?.editor || !view.file) return;
+                const current = view.editor.getCursor().line, previous = this.lastLines.get(view.editor);
+                this.lastLines.set(view.editor, current);
+                if (this.settings.syncOnLineLeave && previous !== undefined && previous !== current &&
+                    this.debounces.has(this.source(view.file))) this.schedule(view.file, 0);
+            };
+            this.registerDomEvent(document, 'keyup', cursorMoved);
+            this.registerDomEvent(document, 'mouseup', cursorMoved);
+            this.registerDomEvent(document, 'selectionchange', cursorMoved);
+        }
+        this.registerEvent(this.app.workspace.on('file-open', file => { if (file) this.schedule(file); }));
+        this.registerEvent(this.app.vault.on('modify', file => this.schedule(file)));
         this.app.workspace.onLayoutReady(() => {
-            this.indexActiveEditorSignatures();
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (view && view.editor && this.settings.autoTriggerOnType) {
-                setTimeout(() => this.checkNewDraftTasks(view.editor), 600);
-            }
+            if (this.stopped) return;
+            for (const file of this.app.vault.getMarkdownFiles()) this.schedule(file);
         });
+        this.notify('就绪');
     }
-
-    onunload() {
-        if (this.debounceTimer) clearTimeout(this.debounceTimer);
-        this.pendingUpdates.clear();
-        this.inFlightUpdates.clear();
-        this.inFlightCreations.clear();
-        this.failedEvents.clear();
+    inScope(file) {
+        const folder = this.settings.syncFolder.trim().replace(/^\/|\/$/g, '');
+        return file?.extension === 'md' && (!folder || file.path.startsWith(folder + '/'));
     }
-
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-        if (!this.settings.syncedSignatures || typeof this.settings.syncedSignatures !== 'object') {
-            this.settings.syncedSignatures = {};
-        }
-    }
-
-    async saveSettings() {
-        await this.saveData(this.settings);
-    }
-
-    updateStatusBar(state, text = '') {
-        if (!this.statusBarItem) return;
-        if (state === 'ready') {
-            this.statusBarItem.setText('📅 GCal: 就绪');
-        } else if (state === 'syncing') {
-            this.statusBarItem.setText(`⏳ GCal: ${text || '同步中...'}`);
-        } else if (state === 'success') {
-            this.statusBarItem.setText(`✅ GCal: ${text || '已同步'}`);
-            setTimeout(() => this.updateStatusBar('ready'), 4000);
-        } else if (state === 'error') {
-            this.statusBarItem.setText(`❌ GCal: ${text || '同步异常'}`);
-            setTimeout(() => this.updateStatusBar('ready'), 5000);
-        }
-    }
-
-    // 核心内容特征签名（剔除 <!-- gcal:... --> 后的净文本内容）
-    getLineSignature(line) {
-        if (!line) return '';
-        return line
-            .replace(/<!-- gcal(?:-deleting|-done|-deleted)?:\s*[^>]+\s*-->/g, '')
-            .replace(/<!-- gcal-syncing -->/g, '')
-            .trim();
-    }
-
-    // 为当前活动笔记中的所有已关联待办建立初始签名索引
-    indexActiveEditorSignatures() {
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view || !view.editor) return;
-        const editor = view.editor;
-        const count = editor.lineCount();
-        let changed = false;
-
-        for (let i = 0; i < count; i++) {
-            const line = editor.getLine(i);
-            const match = line.match(/<!-- gcal:\s*([^>\s]+)\s*-->/);
-            if (match) {
-                const eventId = match[1];
-                const sig = this.getLineSignature(line);
-                if (!this.settings.syncedSignatures[eventId]) {
-                    this.settings.syncedSignatures[eventId] = sig;
-                    changed = true;
-                }
-            }
-        }
-        if (changed) {
-            this.saveSettings();
-        }
-    }
-
-    handleEditorChange(editor) {
-        const cursor = editor.getCursor();
-
-        // 1. 光标切行 (Line Leave) 检测：光标离开正在编辑的行时，立即认为该行修改完毕并触发同步
-        if (this.settings.syncOnLineLeave && this.activeEditingLine !== -1 && this.activeEditingLine !== cursor.line) {
-            const prevLineNum = this.activeEditingLine;
-            if (prevLineNum < editor.lineCount()) {
-                this.checkSpecificLine(editor, prevLineNum);
-            }
-        }
-        this.activeEditingLine = cursor.line;
-
-        // 2. 防抖定时器：连续键盘打字停顿后自动触发检测
-        if (this.debounceTimer) clearTimeout(this.debounceTimer);
-        const debounceMs = Math.max(1000, (Number(this.settings.editDebounceSeconds) || 2.0) * 1000);
-
-        this.debounceTimer = setTimeout(() => {
-            this.handleDebouncedRun(editor);
-        }, debounceMs);
-    }
-
-    handleDebouncedRun(editor) {
-        // 先检查勾选完成状态
-        const completedHandled = this.checkCompletedTasks(editor);
-        if (completedHandled) return;
-
-        // 再检查原地修改更新
-        if (this.settings.autoUpdateOnEdit) {
-            this.checkModifiedTasks(editor);
-        }
-
-        // 最后检查未同步草稿 (!gcal)
-        if (this.settings.autoTriggerOnType) {
-            this.checkNewDraftTasks(editor);
-        }
-    }
-
-    findLineByEventId(editor, eventId, prefixes = ['<!-- gcal:', '<!-- gcal-deleting:', '<!-- gcal-done:']) {
-        const count = editor.lineCount();
-        for (let i = 0; i < count; i++) {
-            const l = editor.getLine(i);
-            if (l.includes(eventId)) {
-                for (const p of prefixes) {
-                    if (l.includes(p)) return i;
-                }
-            }
-        }
-        return -1;
-    }
-
-    checkSpecificLine(editor, lineNum) {
-        const line = editor.getLine(lineNum);
-        if (!line) return;
-
-        // 1. 勾选完成检测
-        const completeMatch = line.match(/^(\s*-\s*\[[xX]\].*?)<!-- gcal(?:-deleting)?:\s*([^>\s]+)\s*-->/);
-        if (completeMatch) {
-            const eventId = completeMatch[2];
-            if (!this.failedEvents.has(eventId)) {
-                this.completeGCalEvent(editor, lineNum, eventId);
-                return;
-            }
-        }
-
-        // 2. 新草稿触发词检测
-        if (this.settings.autoTriggerOnType) {
-            const trigger = (this.settings.triggerKeyword || '!gcal').trim();
-            if (trigger && line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-syncing') && !line.includes('<!-- gcal-deleting:')) {
-                const task = this.parseTaskLine(line);
-                if (task) {
-                    if (this.debounceTimer) {
-                        clearTimeout(this.debounceTimer);
-                        this.debounceTimer = null;
-                    }
-                    this.syncLineAt(editor, lineNum, false);
+    source(file) {
+        if (this.sources.has(file)) return this.sources.get(file);
+        const openEditor = () => {
+            let editor = null;
+            this.app.workspace.iterateAllLeaves(leaf => {
+                if (leaf.view instanceof MarkdownView && leaf.view.file === file && leaf.view.editor) editor = leaf.view.editor;
+            });
+            return editor;
+        };
+        const source = {
+            get key() { return file.path; },
+            read: async () => {
+                if (this.app.vault.getAbstractFileByPath && this.app.vault.getAbstractFileByPath(file.path) !== file) return '';
+                const editor = openEditor();
+                return editor ? editor.getValue() : this.app.vault.read(file);
+            },
+            transform: async fn => {
+                if (this.app.vault.getAbstractFileByPath && this.app.vault.getAbstractFileByPath(file.path) !== file) return;
+                const editor = openEditor();
+                if (!editor) {
+                    await this.app.vault.process(file, text => this.stopped ? text : fn(text));
                     return;
                 }
+                if (this.stopped) return;
+                const before = editor.getValue(), after = fn(before);
+                if (after === before) return;
+                // Smallest contiguous replacement preserves unrelated lines and editor selections.
+                let start = 0, end = before.length, nextEnd = after.length;
+                while (start < end && start < nextEnd && before[start] === after[start]) start++;
+                while (end > start && nextEnd > start && before[end - 1] === after[nextEnd - 1]) { end--; nextEnd--; }
+                editor.replaceRange(after.slice(start, nextEnd), editor.offsetToPos(start), editor.offsetToPos(end));
             }
-        }
-
-        // 3. 内容原地修改检测
-        if (this.settings.autoUpdateOnEdit) {
-            const modMatch = line.match(/^\s*-\s*\[ \](.*?)<!-- gcal:\s*([^>\s]+)\s*-->/);
-            if (modMatch) {
-                const eventId = modMatch[2];
-                this.failedEvents.delete(eventId);
-                const currentSig = this.getLineSignature(line);
-                const lastSig = this.settings.syncedSignatures[eventId];
-
-                if (!lastSig || lastSig !== currentSig) {
-                    const task = this.parseTaskLine(line, lastSig);
-                    if (task) {
-                        this.queueTaskUpdate(eventId, task, currentSig);
-                    }
-                }
-            }
-        }
+        };
+        this.sources.set(file, source); return source;
     }
-
-    // ====================== 1. 完成状态同步 (Delete / Mark Done) ======================
-    checkCompletedTasks(editor) {
-        const lineCount = editor.lineCount();
-        for (let i = 0; i < lineCount; i++) {
-            const line = editor.getLine(i);
-            const match = line.match(/^(\s*-\s*\[[xX]\].*?)<!-- gcal(?:-deleting)?:\s*([^>\s]+)\s*-->/);
-            if (match) {
-                const eventId = match[2];
-                if (this.failedEvents.has(eventId) || this.inFlightUpdates.has(eventId)) continue;
-                this.completeGCalEvent(editor, i, eventId);
-                return true;
-            }
-        }
-        return false;
+    schedule(file, delay = null) {
+        if (this.stopped || !this.inScope(file)) return;
+        const source = this.source(file);
+        clearTimeout(this.debounces.get(source));
+        this.debounces.set(source, setTimeout(() => {
+            this.debounces.delete(source); void this.engine.scan(source);
+        }, delay === null ? Math.max(500, Number(this.settings.editDebounceSeconds) * 1000 || 2000) : delay));
     }
-
-    async completeGCalEvent(editor, lineNum, eventId) {
-        this.inFlightUpdates.add(eventId);
-        this.updateStatusBar('syncing', '完成清理中');
-
-        let targetLine = this.findLineByEventId(editor, eventId, ['<!-- gcal:', '<!-- gcal-deleting:']);
-        if (targetLine === -1) targetLine = lineNum;
-
-        if (targetLine >= 0 && targetLine < editor.lineCount()) {
-            const currentLine = editor.getLine(targetLine);
-            if (currentLine.includes(`<!-- gcal: ${eventId} -->`)) {
-                editor.setLine(targetLine, currentLine.replace(`<!-- gcal: ${eventId} -->`, `<!-- gcal-deleting: ${eventId} -->`));
+    current(fn) {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view?.file || !view.editor) return this.notify('请先打开一个 Markdown 笔记', true);
+        if (!this.inScope(view.file)) return this.notify('当前笔记不在同步文件夹范围内', true);
+        return Promise.resolve(fn(this.source(view.file), view)).catch(e => this.notify(e.message, true));
+    }
+    async syncCurrentLine() {
+        return this.current(async (source, view) => {
+            const index = view.editor.getCursor().line, original = view.editor.getLine(index);
+            if (!taskRows(view.editor.getValue()).some(row => row.index === index)) throw new Error('请选择代码块外的待办任务');
+            const task = parseTask(original, this.settings);
+            if (!task || (!task.date && !task.done)) throw new Error('任务缺少有效日期');
+            if (task.meta.pending && !task.meta.id) {
+                const confirmed = await new Promise(resolve => new ConfirmModal(this.app,
+                    '旧版 syncing 标记没有请求 ID，无法判断日历是否已创建。请先核对并清理重复日程；确认后将重新创建此任务。', resolve).open());
+                if (!confirmed) return;
             }
-        }
-
-        const actionText = this.settings.completeAction === 'delete' ? '从 Google 日历删除' : '标记已完成';
-        const notice = new Notice(`⏳ 待办已勾选，正在${actionText}...`, 2500);
-
-        try {
-            const response = await requestUrl({
-                url: this.settings.webhookUrl,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action: 'delete',
-                    eventId: eventId,
-                    completeMode: this.settings.completeAction,
-                    calendarName: this.settings.calendarName.trim()
-                })
+            const id = task.meta.id || newTaskId();
+            let prepared = false;
+            await source.transform(text => {
+                const lines = text.split('\n');
+                if (lines[index] !== original) return text;
+                let line = original;
+                if (!task.meta.id) line += ' <!-- gcal-task: ' + id + ' -->';
+                if (!task.meta.eventId && !task.done) line = withBinding(line, '', null, id, task.meta.cycle);
+                lines[index] = line; prepared = true; return lines.join('\n');
             });
-
-            notice.hide();
-            const result = safeParseJson(response);
-            const resultMsg = String(result?.message || '');
-
-            const isSuccess = result && (result.status === 'success');
-            const isAlreadyGone = result && (
-                result.action === 'already_deleted' ||
-                resultMsg.includes('不存在') ||
-                resultMsg.includes('已删除') ||
-                resultMsg.includes('日历活动') ||
-                resultMsg.includes('does not exist') ||
-                resultMsg.includes('already') ||
-                resultMsg.includes('not found') ||
-                resultMsg.includes('404')
-            );
-
-            if (isSuccess || isAlreadyGone) {
-                this.failedEvents.delete(eventId);
-                delete this.settings.syncedSignatures[eventId];
-                await this.saveSettings();
-
-                if (this.settings.completeAction === 'delete') {
-                    new Notice('🗑️ 任务已完成，已从 Google 日历中移除日程！', 3000);
-                } else {
-                    new Notice('✔️ 任务已完成，已在 Google 日历中置灰并撤销闹铃！', 3000);
-                }
-                this.updateStatusBar('success', '已完成清理');
-
-                const finalLineNum = this.findLineByEventId(editor, eventId, ['<!-- gcal:', '<!-- gcal-deleting:']);
-                if (finalLineNum !== -1) {
-                    const lineAfter = editor.getLine(finalLineNum);
-                    editor.setLine(finalLineNum, lineAfter.replace(new RegExp(`<!-- gcal(?:-deleting)?:\\s*${eventId}\\s*-->`), `<!-- gcal-done: ${eventId} -->`));
-                }
-            } else {
-                this.failedEvents.add(eventId);
-                new Notice('⚠️ 同步完成状态失败: ' + (result?.message || '未知错误'), 5000);
-                this.updateStatusBar('error', '清理失败');
-
-                const finalLineNum = this.findLineByEventId(editor, eventId, ['<!-- gcal:', '<!-- gcal-deleting:']);
-                if (finalLineNum !== -1) {
-                    const lineAfter = editor.getLine(finalLineNum);
-                    editor.setLine(finalLineNum, lineAfter.replace(`<!-- gcal-deleting: ${eventId} -->`, `<!-- gcal: ${eventId} -->`));
-                }
-            }
-        } catch (err) {
-            notice.hide();
-            console.error('[GCal Complete Error]', err);
-            const errMsg = String(err?.message || '');
-            if (
-                errMsg.includes('404') || 
-                errMsg.includes('不存在') || 
-                errMsg.includes('已删除') || 
-                errMsg.includes('does not exist') || 
-                errMsg.includes('already')
-            ) {
-                this.failedEvents.delete(eventId);
-                delete this.settings.syncedSignatures[eventId];
-                await this.saveSettings();
-
-                new Notice('🗑️ 任务已完成，Google 日历已确认清理！', 3000);
-                this.updateStatusBar('success', '日历已清理');
-
-                const finalLineNum = this.findLineByEventId(editor, eventId, ['<!-- gcal:', '<!-- gcal-deleting:']);
-                if (finalLineNum !== -1) {
-                    const lineAfter = editor.getLine(finalLineNum);
-                    editor.setLine(finalLineNum, lineAfter.replace(new RegExp(`<!-- gcal(?:-deleting)?:\\s*${eventId}\\s*-->`), `<!-- gcal-done: ${eventId} -->`));
-                }
-            } else {
-                this.failedEvents.add(eventId);
-                new Notice('❌ 同步完成状态异常: ' + err.message, 5000);
-                this.updateStatusBar('error', '完成同步异常');
-
-                const finalLineNum = this.findLineByEventId(editor, eventId, ['<!-- gcal:', '<!-- gcal-deleting:']);
-                if (finalLineNum !== -1) {
-                    const lineAfter = editor.getLine(finalLineNum);
-                    editor.setLine(finalLineNum, lineAfter.replace(`<!-- gcal-deleting: ${eventId} -->`, `<!-- gcal: ${eventId} -->`));
-                }
-            }
-        } finally {
-            this.inFlightUpdates.delete(eventId);
-        }
+            if (!prepared) throw new Error('任务在操作期间已移动或修改，请重试');
+            this.engine.enqueue(id, source, true);
+        });
     }
-
-    // ====================== 2. 队列化原地更新 (Queue-Based Edit Sync) ======================
-    checkModifiedTasks(editor) {
-        const lineCount = editor.lineCount();
-        for (let i = 0; i < lineCount; i++) {
-            const line = editor.getLine(i);
-            const match = line.match(/^\s*-\s*\[ \](.*?)<!-- gcal:\s*([^>\s]+)\s*-->/);
-            if (match) {
-                const eventId = match[2];
-                const currentSig = this.getLineSignature(line);
-                const lastSig = this.settings.syncedSignatures[eventId];
-
-                if (!lastSig || lastSig !== currentSig) {
-                    const task = this.parseTaskLine(line, lastSig);
-                    if (task) {
-                        this.queueTaskUpdate(eventId, task, currentSig);
-                    }
-                }
-            }
-        }
+    async adoptLegacy() {
+        return this.current(async source => {
+            const confirmed = await new Promise(resolve => new ConfirmModal(this.app,
+                '将关联当前笔记中的旧版事件。请先在 Apps Script 的 LEGACY_EVENT_IDS 中列出允许迁移的事件 ID，随后将拉取远端内容。', resolve).open());
+            if (confirmed) await this.engine.adopt(source);
+        });
     }
-
-    queueTaskUpdate(eventId, task, signature) {
-        this.pendingUpdates.set(eventId, { task, signature });
-        this.processUpdateQueue();
+    notify(text, error = false) {
+        if (this.stopped) return;
+        this.status?.setText((error ? '❌ ' : '📅 ') + 'GCal: ' + text);
+        if (error) new Notice(text, 6000);
     }
-
-    async processUpdateQueue() {
-        if (this.isProcessingQueue) return;
-        this.isProcessingQueue = true;
-
+    async saveSettings() {
+        const snapshot = JSON.parse(JSON.stringify(this.settings));
+        const next = this.saveChain.catch(() => {}).then(() => this.saveData(snapshot));
+        this.saveChain = next; return next;
+    }
+    async rawRequest(payload) {
+        let response;
         try {
-            for (const [eventId, update] of Array.from(this.pendingUpdates.entries())) {
-                if (this.inFlightUpdates.has(eventId)) continue;
-
-                // 提取最新待办版本并标记在途网络锁
-                this.pendingUpdates.delete(eventId);
-                this.inFlightUpdates.add(eventId);
-
-                // 发起网络更新
-                this.executeGCalUpdate(eventId, update.task, update.signature);
-            }
-        } finally {
-            this.isProcessingQueue = false;
-        }
+            response = await requestUrl({ url: this.settings.webhookUrl, method: 'POST',
+                headers: { 'Content-Type': 'application/json' }, throw: false,
+                body: JSON.stringify({ ...payload, protocol: 2, secret: this.settings.sharedSecret }) });
+        } catch (_) { throw Object.assign(new Error('网络请求失败'), { retryable: true }); }
+        if (response.status >= 400) throw Object.assign(new Error('Webhook HTTP ' + response.status),
+            { retryable: response.status === 429 || response.status >= 500 });
+        const result = readJson(response);
+        if (result.protocol !== 2) throw Object.assign(new Error('服务端版本不兼容，请先重新部署新版 Code.gs'), { retryable: false });
+        if (result.status !== 'success') throw Object.assign(new Error(result.message || '服务端操作失败'),
+            { code: result.code, retryable: result.retryable === true });
+        return result;
     }
-
-    async executeGCalUpdate(eventId, task, signature) {
-        this.updateStatusBar('syncing', '正在更新日历');
-
-        try {
-            const response = await requestUrl({
-                url: this.settings.webhookUrl,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action: 'update',
-                    eventId: eventId,
-                    title: task.title,
-                    date: task.date,
-                    time: task.time,
-                    reminderMinutes: Number(this.settings.reminderMinutes) || 15,
-                    calendarName: this.settings.calendarName.trim()
-                })
-            });
-
-            const result = safeParseJson(response);
-
-            if (result && result.status === 'success') {
-                const timeDesc = task.time ? ` ${task.time}` : ' (全天)';
-                new Notice(`✅ 日历已更新: ${task.title} (${task.date}${timeDesc})`, 3000);
-                this.updateStatusBar('success', '更新完成');
-
-                this.settings.syncedSignatures[eventId] = signature;
-
-                // 如果后端因为原日程在日历端被误删而重新创建，回写新 eventId
-                if (result.eventId && result.eventId !== eventId) {
-                    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                    if (view && view.editor) {
-                        const targetLine = this.findLineByEventId(view.editor, eventId, ['<!-- gcal:']);
-                        if (targetLine !== -1) {
-                            const l = view.editor.getLine(targetLine);
-                            view.editor.setLine(targetLine, l.replace(`<!-- gcal: ${eventId} -->`, `<!-- gcal: ${result.eventId} -->`));
-                        }
-                    }
-                    delete this.settings.syncedSignatures[eventId];
-                    this.settings.syncedSignatures[result.eventId] = signature;
-                }
-
-                await this.saveSettings();
-            } else {
-                new Notice('⚠️ 更新日历日程失败: ' + (result?.message || '未知错误'), 5000);
-                this.updateStatusBar('error', '更新失败');
-            }
-        } catch (err) {
-            console.error('[GCal Update Error]', err);
-            new Notice('❌ 原地更新日历异常: ' + err.message, 5000);
-            this.updateStatusBar('error', '更新异常');
-        } finally {
-            this.inFlightUpdates.delete(eventId);
-
-            // 如果在网络传输期间，用户又打入了新的文字，无缝衔接自动同步最新版
-            if (this.pendingUpdates.has(eventId)) {
-                this.processUpdateQueue();
-            }
+    async send(payload) {
+        if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/?#]+\/exec$/.test(this.settings.webhookUrl)) {
+            throw Object.assign(new Error('请填写 Google Apps Script 的 HTTPS /exec 部署地址'), { retryable: false });
         }
+        if (this.settings.sharedSecret.length < 32) throw Object.assign(new Error('请配置至少 32 个字符的共享密钥'), { retryable: false });
+        const key = this.settings.webhookUrl + '\n' + this.settings.sharedSecret;
+        if (payload.action === 'ping' || this.session !== key) {
+            const ping = await this.rawRequest({ action: 'ping' });
+            this.session = key;
+            if (payload.action === 'ping') return ping;
+        }
+        return this.rawRequest(payload);
     }
-
-    // ====================== 3. 新建草稿同步 (!gcal) ======================
-    findDraftLine(editor, trigger, title) {
-        const count = editor.lineCount();
-        for (let i = 0; i < count; i++) {
-            const line = editor.getLine(i);
-            if (line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-syncing') && !line.includes('<!-- gcal-deleting:')) {
-                if (!title || line.includes(title)) return i;
-            }
-        }
-        return -1;
-    }
-
-    findSyncingLine(editor, title) {
-        const count = editor.lineCount();
-        for (let i = 0; i < count; i++) {
-            const line = editor.getLine(i);
-            if (line.includes('<!-- gcal-syncing -->')) {
-                if (!title || line.includes(title)) return i;
-            }
-        }
-        return -1;
-    }
-
-    restoreSyncingLine(editor, title, trigger) {
-        const lineIdx = this.findSyncingLine(editor, title);
-        if (lineIdx !== -1) {
-            const line = editor.getLine(lineIdx);
-            editor.setLine(lineIdx, line.replace('<!-- gcal-syncing -->', '').trimRight() + ` ${trigger}`);
-        }
-    }
-
-    async deleteEventSilently(eventId) {
-        if (!this.settings.webhookUrl || !eventId) return;
-        try {
-            await requestUrl({
-                url: this.settings.webhookUrl,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action: 'delete',
-                    eventId: eventId,
-                    completeMode: 'delete',
-                    calendarName: this.settings.calendarName.trim()
-                })
-            });
-        } catch (e) {
-            console.error('[GCal Silent Delete Error]', e);
-        }
-    }
-
-    checkNewDraftTasks(editor) {
-        const trigger = (this.settings.triggerKeyword || '!gcal').trim();
-        if (!trigger) return false;
-
-        const lineCount = editor.lineCount();
-        for (let i = 0; i < lineCount; i++) {
-            const line = editor.getLine(i);
-            if (line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-syncing') && !line.includes('<!-- gcal-deleting:')) {
-                const task = this.parseTaskLine(line);
-                if (task) {
-                    const draftKey = `${task.title}:::${task.date}:::${task.time || ''}`;
-                    if (this.inFlightCreations.has(draftKey)) continue;
-
-                    this.syncLineAt(editor, i, false);
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    async syncCurrentLine(editor, manual = false) {
-        const cursor = editor.getCursor();
-        const lineText = editor.getLine(cursor.line);
-
-        const match = lineText.match(/<!-- gcal:\s*([^>\s]+)\s*-->/);
-        if (match) {
-            const task = this.parseTaskLine(lineText);
-            if (task) {
-                const sig = this.getLineSignature(lineText);
-                await this.executeGCalUpdate(match[1], task, sig);
-                return;
-            }
-        }
-        await this.syncLineAt(editor, cursor.line, manual);
-    }
-
-    async syncLineAt(editor, lineNum, manual = false) {
-        const lineText = editor.getLine(lineNum);
-        if (!lineText) return;
-
-        if (lineText.includes('<!-- gcal:') || lineText.includes('<!-- gcal-syncing') || lineText.includes('<!-- gcal-deleting:')) {
-            if (manual) new Notice('ℹ️ 该任务已同步或正在同步 Google 日历。');
-            return;
-        }
-
-        const task = this.parseTaskLine(lineText);
-        if (!task) {
-            if (manual) {
-                new Notice('⚠️ 未检测到有效日期或时间！请确保待办包含 (@YYYY-MM-DD HH:mm) 或 📅 ⏰ 格式。');
-            }
-            return;
-        }
-
-        const draftKey = `${task.title}:::${task.date}:::${task.time || ''}`;
-        if (this.inFlightCreations.has(draftKey)) {
-            console.log('[GCal] Task creation already in flight for:', draftKey);
-            return;
-        }
-
-        if (!this.settings.webhookUrl || !this.settings.webhookUrl.startsWith('http')) {
-            new Notice('❌ 请先在插件设置中填入有效的 Google Apps Script Webhook URL！');
-            return;
-        }
-
-        // 1. 立即上锁
-        this.inFlightCreations.add(draftKey);
-
-        // 2. 立即将编辑区中的 !gcal 替换为 <!-- gcal-syncing --> 占位标签
-        // 彻底消除后续光标切行、防抖定时器等并发触发的重复扫描漏洞
-        const trigger = (this.settings.triggerKeyword || '!gcal').trim();
-        let targetLine = lineNum;
-        let originalLine = editor.getLine(targetLine);
-        if (trigger && originalLine.includes(trigger)) {
-            editor.setLine(targetLine, originalLine.replace(trigger, '').trimRight() + ' <!-- gcal-syncing -->');
-        } else {
-            editor.setLine(targetLine, originalLine.trimRight() + ' <!-- gcal-syncing -->');
-        }
-
-        const notice = new Notice('⏳ 正在同步到 Google 日历...', 0);
-        this.updateStatusBar('syncing', '正在新建日程');
-
-        try {
-            const response = await requestUrl({
-                url: this.settings.webhookUrl,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action: 'create',
-                    title: task.title,
-                    date: task.date,
-                    time: task.time,
-                    reminderMinutes: Number(this.settings.reminderMinutes) || 15,
-                    calendarName: this.settings.calendarName.trim()
-                })
-            });
-
-            notice.hide();
-            const result = safeParseJson(response);
-
-            if (result && result.status === 'success') {
-                const timeDesc = task.time ? ` ${task.time}` : ' (全天)';
-                new Notice(`✅ 已成功同步到 Google 日历！\n📅 ${task.date}${timeDesc}\n🔔 提前 ${this.settings.reminderMinutes} 分钟强提醒`, 4000);
-                this.updateStatusBar('success', '新建日程成功');
-
-                // 动态重新定位行号（优先按 <!-- gcal-syncing --> 精准匹配当前行）
-                let currentIdx = this.findSyncingLine(editor, task.title);
-                if (currentIdx === -1) {
-                    currentIdx = this.findDraftLine(editor, trigger, task.title);
-                }
-                if (currentIdx === -1 && targetLine < editor.lineCount()) {
-                    currentIdx = targetLine;
-                }
-
-                if (currentIdx !== -1) {
-                    const currentLine = editor.getLine(currentIdx);
-
-                    // 关键防御：如果当前行已经被附加上了有效的 <!-- gcal: ... --> 标签（说明其他并发操作已完成写入）
-                    if (currentLine.includes('<!-- gcal:') && !currentLine.includes('<!-- gcal-syncing')) {
-                        console.warn('[GCal] Line already has an active gcal tag! Deleting duplicate event silently:', result.eventId);
-                        this.deleteEventSilently(result.eventId);
-                        return;
-                    }
-
-                    let newLine = currentLine;
-                    newLine = newLine.replace(/<!-- gcal-done:[^>]+-->/g, '');
-
-                    if (newLine.includes('<!-- gcal-syncing -->')) {
-                        newLine = newLine.replace('<!-- gcal-syncing -->', `<!-- gcal: ${result.eventId} -->`);
-                    } else if (trigger && newLine.includes(trigger)) {
-                        newLine = newLine.replace(trigger, '').trimRight() + ` <!-- gcal: ${result.eventId} -->`;
-                    } else {
-                        // 确保只追加一次，如果已有其他 gcal 标签则替换，绝不并列追加两个
-                        newLine = newLine.replace(/<!-- gcal:[^>]+-->/g, '').trimRight() + ` <!-- gcal: ${result.eventId} -->`;
-                    }
-
-                    editor.setLine(currentIdx, newLine);
-
-                    const finalSig = this.getLineSignature(newLine);
-                    this.settings.syncedSignatures[result.eventId] = finalSig;
-                    await this.saveSettings();
-                }
-            } else {
-                new Notice('❌ Google 同步失败: ' + (result?.message || '未知错误'), 6000);
-                this.updateStatusBar('error', '新建失败');
-                this.restoreSyncingLine(editor, task.title, trigger);
-            }
-        } catch (err) {
-            notice.hide();
-            console.error('[GCal Reminder Sync Error]', err);
-            new Notice('❌ 同步异常: ' + err.message, 6000);
-            this.updateStatusBar('error', '新建异常');
-            this.restoreSyncingLine(editor, task.title, trigger);
-        } finally {
-            this.inFlightCreations.delete(draftKey);
-
-            // 自动循环检查当前笔记中是否还有其他未同步的 !gcal 草稿任务
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (view && view.editor && this.settings.autoTriggerOnType) {
-                setTimeout(() => this.checkNewDraftTasks(view.editor), 400);
-            }
-        }
-    }
-
-    // ====================== 4. Google 端回传 (Pull) ======================
-    async pullTasksFromGCal(editor) {
-        if (!this.settings.webhookUrl) {
-            new Notice('❌ 请先在设置中填写 Google Webhook URL！');
-            return;
-        }
-
-        const lineCount = editor.lineCount();
-        const eventIdToLine = new Map();
-
-        for (let i = 0; i < lineCount; i++) {
-            const line = editor.getLine(i);
-            const match = line.match(/<!-- gcal:\s*([^>\s]+)\s*-->/);
-            if (match) {
-                eventIdToLine.set(match[1], i);
-            }
-        }
-
-        if (eventIdToLine.size === 0) {
-            new Notice('ℹ️ 当前笔记中没有已关联 Google 日历的待办任务。');
-            return;
-        }
-
-        const notice = new Notice(`⏳ 正在从 Google 日历比对并拉取 ${eventIdToLine.size} 条待办...`, 0);
-        this.updateStatusBar('syncing', '拉取比对中');
-
-        try {
-            const response = await requestUrl({
-                url: this.settings.webhookUrl,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action: 'pull',
-                    eventIds: Array.from(eventIdToLine.keys()),
-                    calendarName: this.settings.calendarName.trim()
-                })
-            });
-
-            notice.hide();
-            const result = safeParseJson(response);
-
-            if (result && result.status === 'success' && result.events) {
-                let updatedCount = 0;
-                for (const [eventId, gEvent] of Object.entries(result.events)) {
-                    const lineNum = eventIdToLine.get(eventId);
-                    if (lineNum === undefined) continue;
-                    const oldLine = editor.getLine(lineNum);
-
-                    if (!gEvent.exists) {
-                        editor.setLine(lineNum, oldLine.replace(`<!-- gcal: ${eventId} -->`, `<!-- gcal-deleted: ${eventId} -->`));
-                        delete this.settings.syncedSignatures[eventId];
-                        updatedCount++;
-                        continue;
-                    }
-
-                    const localTask = this.parseTaskLine(oldLine);
-                    if (localTask) {
-                        const titleDiff = localTask.title !== gEvent.title;
-                        const dateDiff = localTask.date !== gEvent.date;
-                        const timeDiff = (localTask.time || '') !== (gEvent.time || '');
-
-                        if (titleDiff || dateDiff || timeDiff) {
-                            let newLine = oldLine;
-                            
-                            // 更新标题
-                            if (titleDiff && localTask.title) {
-                                newLine = newLine.replace(localTask.title, gEvent.title);
-                            }
-                            
-                            // 更新时间
-                            const timePart = gEvent.time ? ` ${gEvent.time}` : '';
-                            if (newLine.includes('(@')) {
-                                newLine = newLine.replace(/\(@\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?\)/, `(@${gEvent.date}${timePart})`);
-                            } else if (newLine.includes('📅') || newLine.includes('⏰')) {
-                                newLine = newLine.replace(/📅 ?\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?/, `📅 ${gEvent.date}`);
-                                if (newLine.includes('⏰')) {
-                                    newLine = newLine.replace(/⏰ ?(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}/, `⏰ ${gEvent.date}${timePart}`);
-                                }
-                            }
-
-                            editor.setLine(lineNum, newLine);
-                            this.settings.syncedSignatures[eventId] = this.getLineSignature(newLine);
-                            updatedCount++;
-                        }
-                    }
-                }
-
-                await this.saveSettings();
-
-                if (updatedCount > 0) {
-                    new Notice(`🎉 成功从 Google 日历回传更新了 ${updatedCount} 条待办！`, 4000);
-                    this.updateStatusBar('success', `拉取更新${updatedCount}条`);
-                } else {
-                    new Notice('✨ 所有待办与 Google 日历完全一致，无需更新。', 3000);
-                    this.updateStatusBar('ready');
-                }
-            } else {
-                new Notice('⚠️ 拉取失败: ' + (result?.message || '未知响应内容'), 6000);
-                this.updateStatusBar('error', '拉取失败');
-            }
-        } catch (err) {
-            notice.hide();
-            console.error('[GCal Pull Error]', err);
-            new Notice('❌ 拉取异常: ' + err.message, 6000);
-            this.updateStatusBar('error', '拉取异常');
-        }
-    }
-
-    // ====================== 5. 全量强制同步 ======================
-    async forceSyncAllActiveTasks(editor) {
-        const lineCount = editor.lineCount();
-        let queueCount = 0;
-        for (let i = 0; i < lineCount; i++) {
-            const line = editor.getLine(i);
-            const match = line.match(/^\s*-\s*\[ \](.*?)<!-- gcal:\s*([^>\s]+)\s*-->/);
-            if (match) {
-                const eventId = match[2];
-                const lastSig = this.settings.syncedSignatures[eventId];
-                const task = this.parseTaskLine(line, lastSig);
-                if (task) {
-                    const sig = this.getLineSignature(line);
-                    this.queueTaskUpdate(eventId, task, sig);
-                    queueCount++;
-                }
-            }
-        }
-        if (queueCount > 0) {
-            new Notice(`🚀 已将当前笔记 ${queueCount} 条待办加入同步队列！`, 3000);
-        } else {
-            new Notice('ℹ️ 当前笔记未检测到需要同步的活动待办。', 3000);
-        }
-    }
-
-    // ====================== 6. 智能多格式解析器 ======================
-    parseTaskLine(line, lastSig = null) {
-        let dateStr = null;
-        let timeStr = null;
-
-        // 1. Reminder 格式: (@YYYY-MM-DD HH:mm) 或 (@YYYY-MM-DD)
-        const remMatch = line.match(/\(@(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?\)/);
-        if (remMatch) {
-            dateStr = remMatch[1];
-            if (remMatch[2]) timeStr = remMatch[2];
-        }
-
-        // 2. 闹铃/排程格式: ⏰ [YYYY-MM-DD ]HH:mm 或 ⏰ YYYY-MM-DD
-        const clockMatch = line.match(/⏰ ?(?:(\d{4}-\d{2}-\d{2}) )?(\d{2}:\d{2})/);
-        const clockDateMatch = line.match(/⏰ ?(\d{4}-\d{2}-\d{2})/);
-        const clockTime = clockMatch ? clockMatch[2] : null;
-        const clockDate = clockMatch ? clockMatch[1] : (clockDateMatch ? clockDateMatch[1] : null);
-
-        // 3. 截止日期格式: 📅 YYYY-MM-DD [HH:mm]
-        const dueMatch = line.match(/📅 ?(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?/);
-        const dueDate = dueMatch ? dueMatch[1] : null;
-        const dueTime = dueMatch ? dueMatch[2] : null;
-
-        // 4. 排程日期格式: ⏳ YYYY-MM-DD [HH:mm]
-        const schedMatch = line.match(/⏳ ?(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?/);
-        const schedDate = schedMatch ? schedMatch[1] : null;
-        const schedTime = schedMatch ? schedMatch[2] : null;
-
-        // 日期智能判定与消歧
-        if (!dateStr) {
-            if (dueDate && clockDate && dueDate !== clockDate && lastSig) {
-                // 如果两处日期冲突，看用户刚才具体改了哪一处
-                const lastDue = lastSig.match(/📅 ?(\d{4}-\d{2}-\d{2})/);
-                if (lastDue && lastDue[1] !== dueDate) dateStr = dueDate;
-                else dateStr = clockDate;
-            } else {
-                dateStr = dueDate || clockDate || schedDate;
-            }
-        }
-
-        // 时间智能判定与消歧
-        if (!timeStr) {
-            if (clockTime && dueTime && clockTime !== dueTime && lastSig) {
-                // 如果两处时间冲突（如 ⏰ 06:30 📅 07:30），看用户刚才具体改了哪一处
-                const lastDueTimeMatch = lastSig.match(/📅 ?\d{4}-\d{2}-\d{2} (\d{2}:\d{2})/);
-                const lastDueTime = lastDueTimeMatch ? lastDueTimeMatch[1] : null;
-                if (lastDueTime && lastDueTime !== dueTime) timeStr = dueTime;
-                else timeStr = clockTime;
-            } else {
-                timeStr = clockTime || dueTime || schedTime;
-            }
-        }
-
-        // 5. 裸日期与时间匹配兜底: YYYY-MM-DD 与可选 HH:mm
-        if (!dateStr) {
-            const plainDateMatch = line.match(/\b(\d{4}-\d{2}-\d{2})\b/);
-            if (plainDateMatch) dateStr = plainDateMatch[1];
-        }
-        if (!timeStr) {
-            const plainTimeMatch = line.match(/\b(\d{2}:\d{2})\b/);
-            if (plainTimeMatch) timeStr = plainTimeMatch[1];
-        }
-
-        // 6. 若未指定具体时间点，且配置了自动使用默认时间提醒（避免全天日程 00:00 导致前一天深夜 23:45 响铃）
-        if (!timeStr && this.settings.treatAllDayAsTimed && this.settings.defaultTime) {
-            timeStr = this.settings.defaultTime.trim();
-        }
-
-        if (!dateStr) return null;
-
-        // 清洗 title
-        let title = line;
-        const trigger = (this.settings.triggerKeyword || '!gcal').trim();
-        if (trigger) title = title.replace(trigger, '');
-
-        // 去除复选框
-        title = title.replace(/^\s*-\s*\[[ xX]\]\s*/, '');
-
-        // 去除各种日期时间格式
-        title = title.replace(/\(@\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?\)/g, '');
-        title = title.replace(/📅 ?\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?/g, '');
-        title = title.replace(/⏰ ?(?:(?:\d{4}-\d{2}-\d{2}) )?\d{2}:\d{2}/g, '');
-        title = title.replace(/⏰ ?\d{4}-\d{2}-\d{2}/g, '');
-        title = title.replace(/⏳ ?\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?/g, '');
-        title = title.replace(/🛫 ?\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?/g, '');
-
-        // 去除 gcal 相关的注释标签
-        title = title.replace(/<!-- gcal:[^>]+-->/g, '');
-        title = title.replace(/<!-- gcal-syncing -->/g, '');
-        title = title.replace(/<!-- gcal-done:[^>]+-->/g, '');
-        title = title.replace(/<!-- gcal-deleting:[^>]+-->/g, '');
-        title = title.replace(/<!-- gcal-deleted:[^>]+-->/g, '');
-
-        // 如果提取到了纯文本裸日期与时间，从标题中剥除
-        title = title.replace(/\b\d{4}-\d{2}-\d{2}\b/g, '');
-        title = title.replace(/\b\d{2}:\d{2}\b/g, '');
-
-        title = title.trim();
-        if (!title) title = "Obsidian 提醒任务";
-
-        return { title, date: dateStr, time: timeStr };
-    }
-
     async testConnection() {
-        if (!this.settings.webhookUrl) {
-            new Notice('❌ 请先在设置中填写 Google Webhook URL！');
-            return;
-        }
-        const notice = new Notice('⏳ 正在测试 Google Webhook 连接...', 0);
-        this.updateStatusBar('syncing', '测试连接中');
-
         try {
-            const today = new Date().toISOString().split('T')[0];
-            const response = await requestUrl({
-                url: this.settings.webhookUrl,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    action: 'create',
-                    title: '【测试连接】来自 Obsidian',
-                    date: today,
-                    time: '12:00',
-                    reminderMinutes: 10,
-                    calendarName: this.settings.calendarName.trim()
-                })
-            });
-            notice.hide();
-            let res = safeParseJson(response);
-            if (res && res.status === 'success') {
-                new Notice('🎉 Webhook 连接成功！已在 Google 日历创建一条测试日程。', 5000);
-                this.updateStatusBar('success', '连接正常');
-            } else {
-                new Notice('⚠️ Webhook 连接失败: ' + (res?.message || '未知返回'), 6000);
-                this.updateStatusBar('error', '连接失败');
-            }
-        } catch (err) {
-            notice.hide();
-            new Notice('❌ 连接失败: ' + err.message, 6000);
-            this.updateStatusBar('error', '连接异常');
-        }
+            const result = await this.send({ action: 'ping' });
+            new Notice('连接成功，目标日历：' + result.calendarName);
+            this.notify('连接正常');
+        } catch (error) { this.notify(error.message, true); }
+    }
+    onunload() {
+        this.stopped = true; this.engine.stop();
+        for (const timer of this.debounces.values()) clearTimeout(timer);
+        this.debounces.clear();
     }
 }
-
 class GCalSettingTab extends PluginSettingTab {
-    constructor(app, plugin) {
-        super(app, plugin);
-        this.plugin = plugin;
-    }
-
+    constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
     display() {
-        const { containerEl } = this;
-        containerEl.empty();
-
-        containerEl.createEl('h2', { text: 'Google 日历全闭环同步设置' });
-
-        new Setting(containerEl)
-            .setName('Google Apps Script Webhook URL')
-            .setDesc('粘贴你在 Google Apps Script 部署获得的 Web 应用网址')
-            .addText(text => text
-                .setPlaceholder('https://script.google.com/macros/s/.../exec')
-                .setValue(this.plugin.settings.webhookUrl)
-                .onChange(async (value) => {
-                    this.plugin.settings.webhookUrl = value.trim();
+        this.containerEl.empty();
+        this.containerEl.createEl('h2', { text: 'Google 日历提醒同步' });
+        this.containerEl.createEl('p', { text: '需部署协议 v2 服务端，并配置 SYNC_SECRET、CALENDAR_ID；旧事件须显式迁移。' });
+        const text = (key, name, desc, numeric = false, secret = false) => {
+            new Setting(this.containerEl).setName(name).setDesc(desc).addText(input => {
+                input.setValue(String(this.plugin.settings[key] ?? ''));
+                if (secret) input.inputEl.type = 'password';
+                input.onChange(async value => {
+                    if (numeric && (value.trim() === '' || !Number.isFinite(Number(value)))) return;
+                    this.plugin.settings[key] = numeric ? Number(value) : value.trim();
+                    this.plugin.session = null;
                     await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('专属目标日历名称（可选）')
-            .setDesc('留空则写入默认主日历；建议填入专属日历（如“Obsidian提醒”），让所有待办统一归类')
-            .addText(text => text
-                .setPlaceholder('留空为默认主日历')
-                .setValue(this.plugin.settings.calendarName)
-                .onChange(async (value) => {
-                    this.plugin.settings.calendarName = value.trim();
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('行内新建触发词')
-            .setDesc('输入此触发词（如 !gcal）并回车或停顿，将自动把待办推送到 Google 日历')
-            .addText(text => text
-                .setPlaceholder('!gcal')
-                .setValue(this.plugin.settings.triggerKeyword)
-                .onChange(async (value) => {
-                    this.plugin.settings.triggerKeyword = value.trim();
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('修改任务或日期时间时自动更新日历')
-            .setDesc('开启后，直接在 Obsidian 修改已同步任务的文字、日期或时间，会自动原地同步到 Google 日历')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.autoUpdateOnEdit)
-                .onChange(async (value) => {
-                    this.plugin.settings.autoUpdateOnEdit = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('修改停顿防抖时间（秒）')
-            .setDesc('打字停顿多少秒后触发日历同步（默认 2.0 秒，避免输入一半误触发）')
-            .addText(text => text
-                .setPlaceholder('2.0')
-                .setValue(String(this.plugin.settings.editDebounceSeconds || 2.0))
-                .onChange(async (value) => {
-                    const num = parseFloat(value);
-                    this.plugin.settings.editDebounceSeconds = isNaN(num) ? 2.0 : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('光标跳行时立即同步')
-            .setDesc('开启后，改完某行按回车换行或跳到其他行时，立即认为该行修改完成并触发同步')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.syncOnLineLeave)
-                .onChange(async (value) => {
-                    this.plugin.settings.syncOnLineLeave = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('完成任务时的日历动作')
-            .setDesc('当你在 Obsidian 勾选任务为 [x] 时，Google 日历的处理动作')
-            .addDropdown(dropdown => dropdown
-                .addOption('delete', '彻底从 Google 日历删除（日历清爽干净）')
-                .addOption('markDone', '保留在日历，标题加 ✔️ 并撤销闹铃')
-                .setValue(this.plugin.settings.completeAction)
-                .onChange(async (value) => {
-                    this.plugin.settings.completeAction = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('提前提醒时间（分钟）')
-            .setDesc('写入 Google 日历时的强提醒弹窗提前分钟数（默认 15 分钟）')
-            .addText(text => text
-                .setPlaceholder('15')
-                .setValue(String(this.plugin.settings.reminderMinutes))
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.reminderMinutes = isNaN(num) ? 15 : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('仅写日期时的默认提醒时间')
-            .setDesc('当待办只写了日期没写具体时刻时（如 2026-09-21），自动设为此时间点提醒（默认 09:00），彻底避免全天日程在“前一天深夜 23:45”误响')
-            .addText(text => text
-                .setPlaceholder('09:00')
-                .setValue(this.plugin.settings.defaultTime || '09:00')
-                .onChange(async (value) => {
-                    this.plugin.settings.defaultTime = value.trim() || '09:00';
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('仅写日期时自动转为默认时间')
-            .setDesc('开启后，未写具体时刻的待办自动转为上述时间点（如 09:00），并统一按“提前 15 分钟”正常提醒；关闭后则直接作为全天日程同步')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.treatAllDayAsTimed !== false)
-                .onChange(async (value) => {
-                    this.plugin.settings.treatAllDayAsTimed = value;
-                    await this.plugin.saveSettings();
-                }));
+                });
+            });
+        };
+        text('webhookUrl', 'Webhook URL', 'Google Apps Script 的 /exec 部署地址');
+        text('sharedSecret', '共享密钥', '与服务端 SYNC_SECRET 相同，至少 32 个字符。保存在本地插件配置中。', false, true);
+        text('syncFolder', '同步文件夹', 'Vault 内相对路径；留空表示所有 Markdown 笔记。代码块不参与同步。');
+        text('triggerKeyword', '新建触发词', '默认 !gcal；只有未完成任务会触发新建。');
+        text('timeZone', '时区', '例如 Asia/Shanghai；留空使用当前设备时区。多设备建议固定相同值。');
+        text('defaultTime', '日期任务的默认时间', 'HH:mm，例如 09:00');
+        text('defaultDuration', '默认时长（分钟）', '1–1440', true);
+        text('reminderMinutes', '提前提醒（分钟）', '0 表示准点，-1 关闭；最大 40320', true);
+        text('editDebounceSeconds', '编辑防抖（秒）', '最小 0.5 秒，默认 2', true);
+        for (const [key, name] of [['treatAllDayAsTimed', '日期任务使用默认时间'], ['autoTriggerOnType', '自动新建带触发词的任务'], ['autoUpdateOnEdit', '自动推送任务修改'], ['syncOnLineLeave', '光标离开编辑行时立即同步']]) {
+            new Setting(this.containerEl).setName(name).addToggle(t => t.setValue(this.plugin.settings[key]).onChange(async value => {
+                this.plugin.settings[key] = value; await this.plugin.saveSettings();
+            }));
+        }
+        new Setting(this.containerEl).setName('完成任务后').addDropdown(d => d
+            .addOption('delete', '删除日程').addOption('markDone', '保留日程并关闭提醒')
+            .setValue(this.plugin.settings.completeAction).onChange(async value => {
+                this.plugin.settings.completeAction = value; await this.plugin.saveSettings();
+            }));
+        new Setting(this.containerEl).setName('测试连接').addButton(b => b.setButtonText('测试（不创建事件）').onClick(() => this.plugin.testConnection()));
     }
 }
-
 module.exports = GCalReminderSyncPlugin;
+module.exports._test = { SyncEngine, metadata, taskRows, parseTask, renderRemote, fingerprint, config, replaceTask, DEFAULT_SETTINGS, readJson };

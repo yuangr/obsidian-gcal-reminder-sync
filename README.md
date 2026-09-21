@@ -1,174 +1,122 @@
-﻿# GCal Reminder Sync for Obsidian
+# GCal Reminder Sync for Obsidian
 
-<p align="center">
-  <b>A lightweight, zero-bloat two-way sync & strong reminder plugin between Obsidian tasks and Google Calendar.</b><br>
-  <i>Serverless · Powered by native Google Apps Script · Zero note pollution · Guaranteed mobile system-level notifications</i>
-</p>
+English | [简体中文](README_zh.md)
 
-<p align="center">
-  <b>English</b> | <a href="./README_zh.md"><b>简体中文</b></a>
-</p>
+Sync inline Markdown tasks to Google Calendar events and use Calendar notifications. Task text stays in your vault; titles, dates, times and reminder settings are sent to your Google account.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Obsidian-v0.15.0+-purple.svg" alt="Obsidian Version" />
-  <img src="https://img.shields.io/badge/Google%20Calendar-API%20Supported-blue.svg" alt="Google Calendar" />
-  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License" />
-</p>
+## Upgrading to 2.0
 
----
+**Upgrade both the plugin and Apps Script. Updating the local plugin does not secure an old public webhook.**
 
-## 📖 Why GCal Reminder Sync?
+1. Back up your notes and plugin settings; disable the old plugin.
+2. Deploy the new Code.gs and appsscript.json, configure SYNC_SECRET and CALENDAR_ID.
+3. Replace main.js and manifest.json, then configure the webhook URL, shared secret and timezone.
+4. Run the read-only connection test.
+5. Explicitly migrate existing event links as described below. Retire old deployments that still run unauthenticated code.
 
-Managing tasks and reminders in Obsidian on mobile devices often suffers from three major pain points:
-1. **Unreliable Mobile Alarms**: Once mobile operating systems (Android / iOS) kill or freeze Obsidian in the background, local in-app reminder alarms fail to ring, causing missed meetings and deadlines.
-2. **Heavy-handed Note Pollution**: Some existing sync solutions force you to create "a separate markdown file per task", completely ruining your daily notes, outlines, and checklist workflow.
-3. **Privacy Concerns with 3rd-Party Clouds**: Transmitting sensitive task data to untrusted third-party servers raises security and privacy risks.
+Requires Obsidian 1.5.0+. Desktop and mobile use the same plugin files; no runtime npm installation is required.
 
-**How This Plugin Solves It**:
-- 🎯 **Inline & Minimalist**: Write tasks naturally anywhere in your notes. Add a trigger keyword (e.g., `!gcal`) and it syncs immediately, appending only a clean, hidden comment tag (`<!-- gcal: eventId -->`) at the end of the line. Zero file bloat!
-- 🔒 **100% Private & Serverless**: Operates via your own free, personal **Google Apps Script (GAS)** instance. Data travels point-to-point directly between Obsidian and your Google account.
-- 🔔 **System-Level Guaranteed Reminders**: Events live directly inside Google Calendar, protected by native Android / iOS system alarm daemons. You get lock screen banners and ringtones even when your phone is locked or Obsidian is closed.
-- 🔄 **Full Two-Way Lifecycle**: Supports **instant creation**, **in-place debounced updates**, **auto-cleanup on task completion**, and **pulling updates from Google Calendar**.
+## Behavior
 
----
+- Creates events for unfinished tasks containing the trigger keyword, then updates edits and synchronizes completion.
+- Supports Reminder syntax, 📅, ⏰, ⏳, 🛫, and plain dates.
+- Skips fenced code examples, prose, and completed unlinked tasks.
+- Uses hidden stable task IDs and deterministic Google event IDs to avoid title collisions and duplicate creation after lost responses.
+- Serializes operations and preserves edits made while a request is running.
+- Retries transient failures after 2, 10 and 30 seconds (four attempts total). Permanent errors stop automatic retries.
+- Pull targets the current note, relocates tasks by ID, and skips locally changed/conflicting tasks.
+- Reopening a completed task restores reminders. A deleted event uses a new generation when explicitly recreated.
+- A remotely deleted event is not silently recreated by ordinary editing.
+- Deleting an already-linked task line or note does not automatically delete its event: complete and sync the task first. Removal during the first in-flight creation triggers best-effort cleanup.
+- The plugin runs only while Obsidian is running. Events already delivered to Google can notify independently, subject to Calendar permissions, account sync, network and device settings. Notification delivery is not guaranteed.
+- These are Calendar events, not Google Tasks. There is no recurring-task engine, per-task reminder syntax, full-field synchronization, unattended offline service or automatic multi-device conflict merge.
 
-## ✨ Key Features
+## Deploy the backend
 
-- **Inline Trigger Keyword**: Type `!gcal` (customizable) in any task line and press Enter/pause. It pushes to Google Calendar automatically, removes the trigger word, and inserts the event ID comment.
-- **Queue-Based Asynchronous Sync Engine**:
-  - Freely edit task titles, dates, or times. The plugin updates the existing calendar event in place without recreating it.
-  - Built-in debounce and versioned request queue: keystrokes are never lost; newer edits gracefully coalesce if a previous network request is still in-flight.
-- **Smart Timestamp Disambiguation & Daytime Fallback**:
-  - Supports Obsidian Reminder syntax `(@YYYY-MM-DD HH:mm)`, Tasks plugin syntax (`⏰`, `📅`, `⏳`), and natural date strings.
-  - When multiple dates/times exist on a single line, it intelligently isolates the specific timestamp you just edited.
-  - **Daytime Alarm for Date-Only Tasks**: Date-only tasks automatically receive a daytime default time (e.g. `09:00`), preventing Google Calendar's default midnight (`00:00`) start from triggering reminders at 23:45 the previous night!
-- **Task Completion Auto-Sync**: Checking `- [x]` can automatically delete the event from Google Calendar (or mark it completed/silent).
-- **Two-Way Pull**: Pull external edits made on your phone or Google Calendar back into your Obsidian notes with one click.
-- **Status Bar Indicator**: Real-time persistent status indicator in the bottom-right corner (Ready / Syncing / Synced / Error).
+1. Create a [Google Apps Script project](https://script.google.com/home/start).
+2. Paste google-apps-script/Code.gs into Code.gs.
+3. In the left sidebar, open the gear-shaped Project Settings icon and check “Show appsscript.json manifest file in editor” (the third checkbox below “Enable Chrome V8 runtime”, as shown in the Chinese UI). Return to the script editor, open appsscript.json from the file list, and replace its contents with [the supplied manifest](google-apps-script/appsscript.json), then save. It declares Calendar and external-request scopes and the Calendar v3 service.
+4. Save appsscript.json and reload the editor; Calendar should then appear under Services automatically. Do not click “+” and add it again, or Apps Script reports that the Calendar service identifier is used more than once. This manifest already contains the single Calendar API v3 declaration. If it still does not appear after saving, use “+” to add Calendar API v3 only after removing the existing Calendar object from enabledAdvancedServices; use one method or the other, never both. With the default GCP project, enabling the service enables the API automatically. Only a custom Google Cloud project requires enabling Google Calendar API separately in Cloud Console.
+5. Add these Script properties:
 
----
+| Property | Value |
+| --- | --- |
+| SYNC_SECRET | A password-manager-generated random secret of at least 32 characters; do not publish or commit it |
+| CALENDAR_ID | Exact destination calendar ID from Calendar settings → Integrate calendar |
+| LEGACY_EVENT_IDS | Temporary allowlist for migration only, separated by commas or newlines |
 
-## 🚀 Quick Start Guide (5 Minutes)
+A dedicated calendar is recommended. Calendar selection is pinned on the server; there is no name lookup or fallback to the primary calendar.
 
-The architecture consists of two parts:
-1. **Google Apps Script Backend** (Runs free on Google Cloud, no server needed)
-2. **Obsidian Plugin** (Runs locally in your vault)
+6. Deploy as a Web app, executing as yourself, accessible to Anyone. Every operational request must also authenticate with the configured secret.
+7. Authorize the script and copy its HTTPS /exec URL. For an existing deployment, select a new version in Manage deployments; changed scopes may require reauthorization.
+8. Disable obsolete deployments still serving the old unauthenticated endpoint.
 
----
+## Install and configure
 
-### Step 1: Deploy Google Apps Script Backend
+Copy main.js and manifest.json to .obsidian/plugins/gcal-reminder-sync/ in the vault, then enable the community plugin.
 
-1. Open your browser and go to [Google Apps Script](https://script.google.com/home/start) (log in with your Google account).
-2. Click **"New project"** in the top left, and rename the project to `GCal-Reminder-Sync`.
-3. Clear out the default code in `Code.gs`. Copy and paste the entire content from [`google-apps-script/Code.gs`](./google-apps-script/Code.gs) into the editor.
-4. Click the **Save icon (💾)**.
-5. In the top-right corner, click **"Deploy" ➔ "New deployment"**.
-6. In the configuration modal:
-   - Click the gear icon on the left and choose **"Web app"**.
-   - **Description**: Enter `v1.0`.
-   - **Execute as**: Select **"Me" (your email)**.
-   - **Who has access**: Select **"Anyone"** *(Required so Obsidian can communicate via Webhook)*.
-7. Click **"Deploy"**.
-8. **Authorize Permissions** (First-time setup):
-   - In the "Authorization required" popup, click **"Review permissions"** and select your Google account.
-   - When the "Google hasn't verified this app" warning appears, click **"Advanced"** (bottom left) ➔ click **"Go to GCal-Reminder-Sync (unsafe)"**.
-   - Click **"Allow"**.
-9. Once deployed, Google will provide a **Web app URL**, structured as:
-   ```text
-   https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec
-   ```
-   👉 **Copy and save this URL; you will paste it into the Obsidian plugin settings.**
+Configure the new webhook URL and matching shared secret. The timezone can be an explicit IANA name such as Asia/Shanghai; otherwise the current device timezone is used. Use the same explicit timezone on all devices.
 
----
+| Setting | Default / range |
+| --- | --- |
+| Sync folder | Empty: all Markdown; otherwise a vault-relative folder |
+| Trigger | !gcal |
+| Date-only fallback time | 09:00 |
+| Duration | 30 minutes; 1–1440 |
+| Reminder | 15 minutes; 0 at event time, -1 disabled, maximum 40320 |
+| Completion | Delete the event, or keep it with notifications disabled |
 
-### Step 2: Install Obsidian Plugin
+The shared secret is stored in local plugin data.json. Do not publish that file. Synchronizing plugin settings also synchronizes the secret. The backend does not receive note paths or full note bodies.
 
-#### Method A: Manual Installation (Recommended)
-1. Open your Obsidian vault directory.
-2. Navigate to `.obsidian/plugins/` (enable "Show hidden files" in your OS if needed).
-3. Create a new folder named `gcal-reminder-sync`.
-4. Download the following files from the [latest Release](https://github.com/yuangr/obsidian-gcal-reminder-sync/releases/latest) and place them into `gcal-reminder-sync`:
-   - `main.js`
-   - `manifest.json`
-5. In Obsidian, go to **Settings ➔ Community plugins ➔ Reload plugins**, locate **GCal Reminder Sync**, and toggle it **ON**.
+The connection test reads the configured calendar and creates no event. It does not test phone notification delivery.
 
-#### Method B: Via BRAT Plugin
-1. Install and enable the [BRAT plugin](https://github.com/TfTHacker/obsidian42-brat).
-2. In BRAT settings, add Beta plugin repository:
-   ```text
-   yuangr/obsidian-gcal-reminder-sync
-   ```
+## Migrate 1.x links
 
----
+Legacy comments such as <!-- gcal: abc@google.com --> contain an iCalUID without ownership metadata. Version 2 refuses to modify unowned events.
 
-### Step 3: Configure Plugin Settings
+1. Point CALENDAR_ID at the actual calendar containing those events.
+2. Add the exact legacy IDs from the current note to the server's LEGACY_EVENT_IDS allowlist.
+3. Run “迁移当前笔记的旧版事件关联” (migrate legacy links in the current note) and confirm.
+4. The plugin assigns task identities and pulls the remote content. Back up unsent local edits before migration.
+5. Clear the allowlist after successful migration; owned events continue to work.
 
-Go to Obsidian **Settings ➔ Community plugins ➔ GCal Reminder Sync**:
+For old <!-- gcal-syncing --> markers without task IDs, check Calendar for an already-created event before confirming manual recovery using the current-line sync command. New pending requests have stable IDs and can recover automatically.
 
-| Setting | Recommended Value | Description |
-| :--- | :--- | :--- |
-| **Google Apps Script Webhook URL** | Paste your Web app URL | Required. Format: `https://script.google.com/macros/s/.../exec` |
-| **Target Calendar Name (Optional)** | `Obsidian Reminders` or empty | Leave empty for your primary default calendar, or specify a custom calendar name |
-| **Trigger Keyword** | `!gcal` | Keyword in task lines that triggers calendar event creation |
-| **Default Time for Date-Only Tasks** | `09:00` | Fallback time used when a task only has a date without specific hours/minutes |
-| **Convert Date-Only to Default Time** | **Enabled** | Eliminates the midnight (00:00) bug where 15-minute reminders ring at 23:45 the previous night |
-| **Auto Update on Edit** | **Enabled** | In-place update Google Calendar when you modify task title, date, or time in Obsidian |
-| **Edit Debounce Delay (seconds)** | `2.0` | Syncs after pausing typing for 2 seconds to avoid excessive network requests |
-| **Sync Immediately on Line Change** | **Enabled** | Triggers sync immediately when moving the cursor to another line |
-| **Task Completion Behavior** | **Delete from Calendar** | Cleanly removes the event from Google Calendar when checking `[x]` |
-| **Popup Reminder Notice (minutes)** | `15` | Minutes before the event for system popup/alarm reminders (default: 15) |
+The old calendarName setting no longer selects a destination. The old syncedSignatures map is not used as proof of synchronization.
 
-> 💡 **Connection Test**: Click **"Test Webhook Connection"** at the bottom of the settings tab. A success notice confirms your setup is complete!
+## Task examples
 
----
+~~~markdown
+- [ ] Team meeting (@2026-09-25 14:30) !gcal
+- [ ] Submit report ⏰ 2026-09-25 17:00 📅 2026-09-25 !gcal
+- [ ] Buy gift 📅 2026-09-26 !gcal
+- [ ] Study ⏳ 2026-09-26 10:00 !gcal
+- [ ] Appointment 2026-09-27 10:00 !gcal
+~~~
 
-## 📝 Task Syntax Examples
+Timestamp precedence is deterministic: Reminder → ⏰ → 📅 → ⏳ → 🛫 → plain date. Avoid conflicting timestamps on one task. Pull preserves the supported date style and exact time; remote all-day events retain an all-day marker.
 
-The plugin supports diverse, flexible task formats:
+When copying a task as a new independent task, remove all its gcal comments and add the trigger again. Copies retaining the same task ID are not separate tasks.
 
-### 1. Obsidian Reminder Plugin Syntax
-```markdown
-- [ ] Team weekly sync meeting (@2026-09-20 14:30) !gcal
-```
+## Conflicts and recovery
 
-### 2. Obsidian Tasks Plugin Syntax
-```markdown
-- [ ] Submit quarterly financial review ⏰ 2026-09-21 17:00 📅 2026-09-21 !gcal
-```
+- Edits are debounced; the optional line-leave setting flushes earlier.
+- Completion is queued after in-flight updates. Done markers are written only after server confirmation.
+- Pull skips unsent local edits and tasks changed during the request.
+- After comparing both sides, manual current-line sync or “retry all linked tasks” explicitly pushes local fields over the remote version. Preserve remote changes you want to keep first.
+- On another device, Pull first to establish a baseline. Unknown existing active links do not overwrite Google on startup.
+- Fix permanent errors, then run a manual retry. Reloading the plugin does not reset persisted retry exhaustion.
+- A 1.x client cannot call the v2 backend because it lacks authentication and protocol fields.
 
-### 3. Date-Only Tasks (Automatic Daytime Reminder)
-```markdown
-- [ ] Buy birthday gift for friend 📅 2026-09-22 !gcal
-```
-*(Automatically scheduled at 09:00 on that day; rings at 08:45 without previous-night false alarms)*
+## Development
 
-### 4. Plain Natural Language Dates
-```markdown
-- [ ] Renew driver license 2026-09-23 10:00 !gcal
-```
+Node.js 18+; no third-party test dependencies:
 
-> **After Synchronization**:
-> The trigger keyword is automatically replaced by a clean HTML comment containing the event ID:
-> `- [ ] Team weekly sync meeting (@2026-09-20 14:30) <!-- gcal: xxxxxxxx@google.com -->`
+~~~sh
+npm test
+npm run check
+~~~
 
----
+Tests execute the real client and server sources with simulated Obsidian/Google APIs. They never access a live account. Before publishing, use a separate test calendar to verify desktop/mobile creation, editing, Pull, completion, reopening, OAuth authorization and phone notification delivery.
 
-## ❓ Troubleshooting (FAQ)
-
-### Q1: Google shows "Google hasn't verified this app" during authorization?
-- **Expected behavior**: This is your own private script running under your personal Google account; it does not need public verification.
-- **Solution**: Click **"Advanced"** (bottom left) ➔ **"Go to GCal-Reminder-Sync (unsafe)"** ➔ **"Allow"**. Your data stays 100% inside your personal Google ecosystem.
-
-### Q2: Why did an all-day reminder ring at 23:45 the previous day instead of 15 minutes before?
-- **Cause**: In Google Calendar, an all-day event technically starts at 00:00 midnight. A "15-minute before" reminder therefore calculates to 23:45 the night before.
-- **Solution**: Enable **"Convert Date-Only to Default Time"** (default `09:00`) in settings. It schedules the event during daytime hours so your reminder sounds at 08:45 AM on the actual day.
-
-### Q3: How to sync across multiple devices (PC / Android / iPhone)?
-- Use your preferred vault sync tool (Remotely Save, WebDAV, Git, iCloud, or Obsidian Sync).
-- The task line retains `<!-- gcal: eventId -->`. Checking `[x]` or editing on any device will seamlessly update or remove the corresponding Google Calendar event.
-
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](./LICENSE). Contributions and issues are welcome!
+[MIT License](LICENSE)
