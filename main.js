@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, MarkdownView } = require('obsidian');
+﻿const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, MarkdownView } = require('obsidian');
 
 const DEFAULT_SETTINGS = {
     webhookUrl: '',
@@ -38,6 +38,7 @@ class GCalReminderSyncPlugin extends Plugin {
         this.debounceTimer = null;
         this.activeEditingLine = -1;
         this.inFlightUpdates = new Set();
+        this.inFlightCreations = new Set();
         this.pendingUpdates = new Map(); // eventId -> { task, signature }
         this.failedEvents = new Set();
         this.isProcessingQueue = false;
@@ -144,6 +145,7 @@ class GCalReminderSyncPlugin extends Plugin {
         if (this.debounceTimer) clearTimeout(this.debounceTimer);
         this.pendingUpdates.clear();
         this.inFlightUpdates.clear();
+        this.inFlightCreations.clear();
         this.failedEvents.clear();
     }
 
@@ -178,6 +180,7 @@ class GCalReminderSyncPlugin extends Plugin {
         if (!line) return '';
         return line
             .replace(/<!-- gcal(?:-deleting|-done|-deleted)?:\s*[^>]+\s*-->/g, '')
+            .replace(/<!-- gcal-syncing -->/g, '')
             .trim();
     }
 
@@ -273,9 +276,13 @@ class GCalReminderSyncPlugin extends Plugin {
         // 2. 新草稿触发词检测
         if (this.settings.autoTriggerOnType) {
             const trigger = (this.settings.triggerKeyword || '!gcal').trim();
-            if (trigger && line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-deleting:')) {
+            if (trigger && line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-syncing') && !line.includes('<!-- gcal-deleting:')) {
                 const task = this.parseTaskLine(line);
                 if (task) {
+                    if (this.debounceTimer) {
+                        clearTimeout(this.debounceTimer);
+                        this.debounceTimer = null;
+                    }
                     this.syncLineAt(editor, lineNum, false);
                     return;
                 }
@@ -542,11 +549,49 @@ class GCalReminderSyncPlugin extends Plugin {
         const count = editor.lineCount();
         for (let i = 0; i < count; i++) {
             const line = editor.getLine(i);
-            if (line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-deleting:')) {
+            if (line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-syncing') && !line.includes('<!-- gcal-deleting:')) {
                 if (!title || line.includes(title)) return i;
             }
         }
         return -1;
+    }
+
+    findSyncingLine(editor, title) {
+        const count = editor.lineCount();
+        for (let i = 0; i < count; i++) {
+            const line = editor.getLine(i);
+            if (line.includes('<!-- gcal-syncing -->')) {
+                if (!title || line.includes(title)) return i;
+            }
+        }
+        return -1;
+    }
+
+    restoreSyncingLine(editor, title, trigger) {
+        const lineIdx = this.findSyncingLine(editor, title);
+        if (lineIdx !== -1) {
+            const line = editor.getLine(lineIdx);
+            editor.setLine(lineIdx, line.replace('<!-- gcal-syncing -->', '').trimRight() + ` ${trigger}`);
+        }
+    }
+
+    async deleteEventSilently(eventId) {
+        if (!this.settings.webhookUrl || !eventId) return;
+        try {
+            await requestUrl({
+                url: this.settings.webhookUrl,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    action: 'delete',
+                    eventId: eventId,
+                    completeMode: 'delete',
+                    calendarName: this.settings.calendarName.trim()
+                })
+            });
+        } catch (e) {
+            console.error('[GCal Silent Delete Error]', e);
+        }
     }
 
     checkNewDraftTasks(editor) {
@@ -556,9 +601,12 @@ class GCalReminderSyncPlugin extends Plugin {
         const lineCount = editor.lineCount();
         for (let i = 0; i < lineCount; i++) {
             const line = editor.getLine(i);
-            if (line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-deleting:')) {
+            if (line.includes(trigger) && !line.includes('<!-- gcal:') && !line.includes('<!-- gcal-syncing') && !line.includes('<!-- gcal-deleting:')) {
                 const task = this.parseTaskLine(line);
                 if (task) {
+                    const draftKey = `${task.title}:::${task.date}:::${task.time || ''}`;
+                    if (this.inFlightCreations.has(draftKey)) continue;
+
                     this.syncLineAt(editor, i, false);
                     return true;
                 }
@@ -587,8 +635,8 @@ class GCalReminderSyncPlugin extends Plugin {
         const lineText = editor.getLine(lineNum);
         if (!lineText) return;
 
-        if (lineText.includes('<!-- gcal:') || lineText.includes('<!-- gcal-deleting:')) {
-            if (manual) new Notice('ℹ️ 该任务已同步过 Google 日历。');
+        if (lineText.includes('<!-- gcal:') || lineText.includes('<!-- gcal-syncing') || lineText.includes('<!-- gcal-deleting:')) {
+            if (manual) new Notice('ℹ️ 该任务已同步或正在同步 Google 日历。');
             return;
         }
 
@@ -600,9 +648,29 @@ class GCalReminderSyncPlugin extends Plugin {
             return;
         }
 
+        const draftKey = `${task.title}:::${task.date}:::${task.time || ''}`;
+        if (this.inFlightCreations.has(draftKey)) {
+            console.log('[GCal] Task creation already in flight for:', draftKey);
+            return;
+        }
+
         if (!this.settings.webhookUrl || !this.settings.webhookUrl.startsWith('http')) {
             new Notice('❌ 请先在插件设置中填入有效的 Google Apps Script Webhook URL！');
             return;
+        }
+
+        // 1. 立即上锁
+        this.inFlightCreations.add(draftKey);
+
+        // 2. 立即将编辑区中的 !gcal 替换为 <!-- gcal-syncing --> 占位标签
+        // 彻底消除后续光标切行、防抖定时器等并发触发的重复扫描漏洞
+        const trigger = (this.settings.triggerKeyword || '!gcal').trim();
+        let targetLine = lineNum;
+        let originalLine = editor.getLine(targetLine);
+        if (trigger && originalLine.includes(trigger)) {
+            editor.setLine(targetLine, originalLine.replace(trigger, '').trimRight() + ' <!-- gcal-syncing -->');
+        } else {
+            editor.setLine(targetLine, originalLine.trimRight() + ' <!-- gcal-syncing -->');
         }
 
         const notice = new Notice('⏳ 正在同步到 Google 日历...', 0);
@@ -631,42 +699,57 @@ class GCalReminderSyncPlugin extends Plugin {
                 new Notice(`✅ 已成功同步到 Google 日历！\n📅 ${task.date}${timeDesc}\n🔔 提前 ${this.settings.reminderMinutes} 分钟强提醒`, 4000);
                 this.updateStatusBar('success', '新建日程成功');
 
-                // 动态重新定位行号（防止换行导致行号漂移）
-                let targetLine = lineNum;
-                const trigger = (this.settings.triggerKeyword || '!gcal').trim();
-                const curText = (targetLine < editor.lineCount()) ? editor.getLine(targetLine) : '';
-                if (!curText.includes(trigger) || curText.includes('<!-- gcal:')) {
-                    const found = this.findDraftLine(editor, trigger, task.title);
-                    if (found !== -1) targetLine = found;
+                // 动态重新定位行号（优先按 <!-- gcal-syncing --> 精准匹配当前行）
+                let currentIdx = this.findSyncingLine(editor, task.title);
+                if (currentIdx === -1) {
+                    currentIdx = this.findDraftLine(editor, trigger, task.title);
+                }
+                if (currentIdx === -1 && targetLine < editor.lineCount()) {
+                    currentIdx = targetLine;
                 }
 
-                const currentLine = editor.getLine(targetLine);
-                let newLine = currentLine;
+                if (currentIdx !== -1) {
+                    const currentLine = editor.getLine(currentIdx);
 
-                // 清除原有的已完成标签（如果存在）
-                newLine = newLine.replace(/<!-- gcal-done:[^>]+-->/g, '');
+                    // 关键防御：如果当前行已经被附加上了有效的 <!-- gcal: ... --> 标签（说明其他并发操作已完成写入）
+                    if (currentLine.includes('<!-- gcal:') && !currentLine.includes('<!-- gcal-syncing')) {
+                        console.warn('[GCal] Line already has an active gcal tag! Deleting duplicate event silently:', result.eventId);
+                        this.deleteEventSilently(result.eventId);
+                        return;
+                    }
 
-                if (trigger && newLine.includes(trigger)) {
-                    newLine = newLine.replace(trigger, '').trimRight() + ` <!-- gcal: ${result.eventId} -->`;
-                } else {
-                    newLine = newLine.trimRight() + ` <!-- gcal: ${result.eventId} -->`;
+                    let newLine = currentLine;
+                    newLine = newLine.replace(/<!-- gcal-done:[^>]+-->/g, '');
+
+                    if (newLine.includes('<!-- gcal-syncing -->')) {
+                        newLine = newLine.replace('<!-- gcal-syncing -->', `<!-- gcal: ${result.eventId} -->`);
+                    } else if (trigger && newLine.includes(trigger)) {
+                        newLine = newLine.replace(trigger, '').trimRight() + ` <!-- gcal: ${result.eventId} -->`;
+                    } else {
+                        // 确保只追加一次，如果已有其他 gcal 标签则替换，绝不并列追加两个
+                        newLine = newLine.replace(/<!-- gcal:[^>]+-->/g, '').trimRight() + ` <!-- gcal: ${result.eventId} -->`;
+                    }
+
+                    editor.setLine(currentIdx, newLine);
+
+                    const finalSig = this.getLineSignature(newLine);
+                    this.settings.syncedSignatures[result.eventId] = finalSig;
+                    await this.saveSettings();
                 }
-
-                editor.setLine(targetLine, newLine);
-
-                const finalSig = this.getLineSignature(newLine);
-                this.settings.syncedSignatures[result.eventId] = finalSig;
-                await this.saveSettings();
             } else {
                 new Notice('❌ Google 同步失败: ' + (result?.message || '未知错误'), 6000);
                 this.updateStatusBar('error', '新建失败');
+                this.restoreSyncingLine(editor, task.title, trigger);
             }
         } catch (err) {
             notice.hide();
             console.error('[GCal Reminder Sync Error]', err);
             new Notice('❌ 同步异常: ' + err.message, 6000);
             this.updateStatusBar('error', '新建异常');
+            this.restoreSyncingLine(editor, task.title, trigger);
         } finally {
+            this.inFlightCreations.delete(draftKey);
+
             // 自动循环检查当前笔记中是否还有其他未同步的 !gcal 草稿任务
             const view = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (view && view.editor && this.settings.autoTriggerOnType) {
@@ -896,6 +979,7 @@ class GCalReminderSyncPlugin extends Plugin {
 
         // 去除 gcal 相关的注释标签
         title = title.replace(/<!-- gcal:[^>]+-->/g, '');
+        title = title.replace(/<!-- gcal-syncing -->/g, '');
         title = title.replace(/<!-- gcal-done:[^>]+-->/g, '');
         title = title.replace(/<!-- gcal-deleting:[^>]+-->/g, '');
         title = title.replace(/<!-- gcal-deleted:[^>]+-->/g, '');
